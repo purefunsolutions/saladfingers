@@ -6,6 +6,8 @@ SPDX-License-Identifier: MIT OR Apache-2.0 OR BSD-3-Clause
 
 # saladfingers
 
+![saladfingers](assets/saladfingers-logo.jpeg)
+
 Rent cheap consumer GPUs from [SaladCloud](https://salad.com) for **minimum billed
 seconds**, plus the [Nix](https://nixos.org) tooling to build and push the GPU
 container images those jobs run in.
