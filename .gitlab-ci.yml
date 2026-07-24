@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Mika Tammi / Pure Fun Solutions
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR BSD-3-Clause
+stages:
+  - ci
+  - publish
+ci:
+  stage: ci
+  interruptible: true
+  script:
+    - nix flake check -L
+    - nix build -L
+ci-image:
+  stage: ci
+  interruptible: true
+  script:
+    - nix build -L .#packages.x86_64-linux.gpu-probe-image
+# macOS build disabled for now (no macOS runner). Re-enable when one is available:
+# ci-macos:
+#   stage: ci
+#   interruptible: true
+#   script:
+#     - nix build -L .#packages.aarch64-darwin.default
+# Mirror master to the public GitHub repository. GITHUB_MIRROR_URL is a masked CI
+# variable (never in this file, which itself gets mirrored).
+publish-github:
+  stage: publish
+  interruptible: false
+  variables:
+    GIT_DEPTH: "0"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+  script:
+    - git push "$GITHUB_MIRROR_URL" "HEAD:master" --tags

@@ -1,0 +1,93 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Mika Tammi / Pure Fun Solutions
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR BSD-3-Clause
+
+# Example saladfingers configuration.
+#
+# Global config lives at ~/.config/saladfingers/config.toml; a project may also ship
+# a ./saladfingers.toml with profiles. CLI flags > env > ./saladfingers.toml >
+# global config. NEVER put secrets in these files — credentials come from the
+# environment variables named below.
+
+[salad]
+# From the SaladCloud portal URL. There is no list-organizations API, so these must
+# be set explicitly.
+organization = "my-org"
+project = "my-project"
+# Default scheduling priority: high | medium | low | batch.
+priority = "batch"
+# Optional default country allow-list (ISO alpha-2, lowercase).
+# country_codes = ["us", "de", "fi"]
+
+# Bulk artifact storage (any S3-compatible backend: R2, S3, B2, MinIO, Garage).
+# The agent only ever receives presigned URLs — never these credentials.
+[storage]
+endpoint = "https://<accountid>.r2.cloudflarestorage.com"
+region = "auto"
+bucket = "my-artifacts"
+path_style = false
+# Names of the environment variables holding the credentials (not the values).
+access_key_env = "SALADFINGERS_S3_ACCESS_KEY"
+secret_key_env = "SALADFINGERS_S3_SECRET_KEY"
+# Max presigned-URL blocks per artifact. Each block is 4 GiB, so this is the size ceiling
+# for any single input/output/checkpoint (blocks x 4 GiB). Default 64 (256 GiB); raise it
+# for larger model weights (e.g. 256 = 1 TiB). Clamped to 4096 (16 TiB).
+# max_artifact_parts = 64
+
+# Container registry saladfingers pushes GPU images to. Registry-agnostic: set the
+# base and the auth kind. `basic` covers GHCR, GitLab, Quay, and self-hosted. There
+# is no default registry — `image push` errors loudly if `base` is unset.
+[registry]
+base = "registry.example.com/my-org/salad"
+auth_kind = "basic"                      # basic | docker_hub
+# Pull credentials (used to deploy images at run time). Names of env vars, not values.
+username_env = "SALADFINGERS_REGISTRY_USER"
+password_env = "SALADFINGERS_REGISTRY_PASSWORD"
+# Optional separate push credentials for `image push`. If unset, push falls back to
+# the SALADFINGERS_REGISTRY_PUSH_USER / _PASS env vars, then to the pull creds above.
+# push_username_env = "SALADFINGERS_REGISTRY_PUSH_USER"
+# push_password_env = "SALADFINGERS_REGISTRY_PUSH_PASS"
+
+# ---------------------------------------------------------------------------
+# Profiles: named run configurations. Reference with `--profile <name>`.
+# ---------------------------------------------------------------------------
+
+# Run infurer's ignored CUDA kernel tests on a rented RTX 40-series card.
+[profiles.kernels]
+image = "kernel-test"                    # a saladfingers.images.<name>
+gpu_classes = ["rtx 4090", "rtx 3090"]   # resolved to UUIDs live; first-available
+cpu = 8
+memory_gb = 30
+disk_gb = 20
+priority = "batch"
+max_duration = "20m"
+
+# A one-shot training run with checkpoint sync.
+[profiles.train]
+image = "infurer-train"
+gpu_classes = ["rtx 4090"]
+cpu = 8
+memory_gb = 40
+disk_gb = 60
+priority = "low"
+max_duration = "4h"
+min_download_mbps = 50.0
+min_upload_mbps = 10.0
+
+# The checkpoint DIRECTORY (relative to the job workdir): restored before the run
+# starts, watched and re-uploaded as it changes, so an interrupted run resumes.
+[profiles.train.checkpoint]
+dir = "ckpts"
+interval_secs = 120
+
+[profiles.train.artifacts]
+push = ["ckpts/latest/**"]
+
+# An inference service.
+[profiles.infer]
+image = "qwen36-serve"
+gpu_classes = ["rtx 4090 (24 gb)"]
+cpu = 8
+memory_gb = 30
+disk_gb = 40
+priority = "high"

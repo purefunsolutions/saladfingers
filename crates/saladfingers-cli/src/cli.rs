@@ -1,0 +1,427 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Mika Tammi / Pure Fun Solutions
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0 OR BSD-3-Clause
+
+//! Command-line interface definition (clap derive).
+//!
+//! The full command tree is defined here so `saladfingers --help` documents the
+//! whole surface from M0. Handlers are filled in over milestones M1–M6.
+
+use std::path::PathBuf;
+
+use clap::{Args, Parser, Subcommand};
+
+/// Rent SaladCloud GPUs for minimum billed seconds.
+#[derive(Debug, Parser)]
+#[command(name = "saladfingers", version, about, long_about = None)]
+pub struct Cli {
+    /// Path to the global config file (default: `~/.config/saladfingers/config.toml`).
+    #[arg(long, env = "SALADFINGERS_CONFIG", global = true)]
+    pub config: Option<PathBuf>,
+
+    /// Organization override.
+    #[arg(long, env = "SALADFINGERS_ORG", global = true)]
+    pub org: Option<String>,
+
+    /// Project override.
+    #[arg(long, env = "SALADFINGERS_PROJECT", global = true)]
+    pub project: Option<String>,
+
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+/// Top-level subcommands.
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Interactively write the global config.
+    Init,
+    /// Validate configuration; with `--live`, probe a rented GPU.
+    Doctor(DoctorArgs),
+    /// List GPU classes and per-priority prices.
+    GpuClasses(GpuClassesArgs),
+    /// Show organization quotas.
+    Quotas(ReadArgs),
+    /// Estimate the cost of a run.
+    #[command(subcommand)]
+    Cost(CostCommand),
+    /// Run a one-shot batch job on a rented GPU.
+    Run(RunArgs),
+    /// Re-attach to a detached run.
+    Attach(RunIdArgs),
+    /// List runs merged with their live group states.
+    Ls(LsArgs),
+    /// Show a run's status.
+    Status(RunIdArgs),
+    /// Watch a run's state transitions (read-only).
+    Watch(RunIdArgs),
+    /// Cancel a run (stop and delete its groups).
+    Cancel(RunIdArgs),
+    /// Internal: detached reaper that stops a `--detach` run's groups once it
+    /// finishes (or a hard cap elapses), so a detached run can't bill forever.
+    #[command(hide = true)]
+    Reap(RunIdArgs),
+    /// Query a run's logs (works after group deletion).
+    Logs(LogsArgs),
+    /// Garbage-collect leftover container groups.
+    Gc(GcArgs),
+    /// Interactive GPU dev session.
+    #[command(subcommand)]
+    Session(SessionCommand),
+    /// Inference serving behind the gateway.
+    #[command(subcommand)]
+    Serve(ServeCommand),
+    /// Benchmark node behavior.
+    #[command(subcommand)]
+    Bench(BenchCommand),
+    /// Build and push GPU container images.
+    #[command(subcommand)]
+    Image(ImageCommand),
+    /// Run the node environment probe on a rented GPU.
+    GpuProbe(GpuProbeArgs),
+}
+
+/// Common flag for read commands.
+#[derive(Debug, Args)]
+pub struct ReadArgs {
+    /// Emit JSON instead of a table.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Positional run id.
+#[derive(Debug, Args)]
+pub struct RunIdArgs {
+    /// Run identifier (e.g. `sf-x7k2mq`).
+    pub run_id: String,
+    /// Emit JSON instead of a table.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct DoctorArgs {
+    /// Also run a live GPU probe on the cheapest class.
+    #[arg(long)]
+    pub live: bool,
+    /// Emit JSON instead of a table.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct GpuClassesArgs {
+    /// Refresh the cached class list.
+    #[arg(long)]
+    pub refresh: bool,
+    /// Include availability.
+    #[arg(long)]
+    pub availability: bool,
+    /// Emit JSON instead of a table.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Cost subcommands.
+#[derive(Debug, Subcommand)]
+pub enum CostCommand {
+    /// Estimate the cost of a run.
+    Estimate(CostEstimateArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CostEstimateArgs {
+    /// GPU class name or UUID.
+    #[arg(long)]
+    pub gpu_class: String,
+    /// Priority tier.
+    #[arg(long, default_value = "batch")]
+    pub priority: String,
+    /// Number of hours.
+    #[arg(long)]
+    pub hours: f64,
+    /// Number of replicas.
+    #[arg(long, default_value_t = 1)]
+    pub replicas: u32,
+    /// Emit JSON instead of a table.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RunArgs {
+    /// Profile name from the project config.
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// Image reference override.
+    #[arg(long)]
+    pub image: Option<String>,
+    /// GPU class name or UUID (repeatable = first-available).
+    #[arg(long = "gpu-class")]
+    pub gpu_classes: Vec<String>,
+    /// Number of shards (each a single-replica group). Given explicitly, it overrides
+    /// the profile in BOTH directions — a profile's 8 with `--replicas 2` runs 2, not 8.
+    /// Default: the profile's value, else 1.
+    #[arg(long)]
+    pub replicas: Option<u32>,
+    /// Extra environment variables `KEY=VALUE`.
+    #[arg(long = "env")]
+    pub env: Vec<String>,
+    /// Input `SRC[:DST]` to stage in.
+    #[arg(long = "input")]
+    pub inputs: Vec<String>,
+    /// Output `GLOB[:NAME]` to ship out.
+    #[arg(long = "output")]
+    pub outputs: Vec<String>,
+    /// Priority tier.
+    #[arg(long)]
+    pub priority: Option<String>,
+    /// Country allow-list (ISO alpha-2).
+    #[arg(long = "country")]
+    pub countries: Vec<String>,
+    /// Hard wall-clock budget (e.g. `45m`).
+    #[arg(long)]
+    pub max_duration: Option<String>,
+    /// Disable the startup bandwidth gate.
+    #[arg(long)]
+    pub no_gate: bool,
+    /// Checkpoint directory to save + restore across interruptions (e.g. `/work/ckpt`).
+    /// The agent restores the latest checkpoint before the command starts and uploads it
+    /// as it changes, so a re-run resumes from where it left off.
+    #[arg(long)]
+    pub checkpoint: Option<String>,
+    /// How often (seconds) the agent scans the checkpoint dir for changes.
+    #[arg(long, default_value_t = 30)]
+    pub checkpoint_interval: u64,
+    /// A checkpoint uploads once no file changed within this many seconds.
+    #[arg(long, default_value_t = 15)]
+    pub checkpoint_quiesce: u64,
+    /// Create the groups and return immediately.
+    #[arg(long)]
+    pub detach: bool,
+    /// Human-readable label for the run.
+    #[arg(long)]
+    pub name_hint: Option<String>,
+    /// The command to run on the GPU (after `--`).
+    #[arg(last = true, required = true)]
+    pub command: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct LsArgs {
+    /// Include terminal/old runs.
+    #[arg(long)]
+    pub all: bool,
+    /// Emit JSON instead of a table.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct LogsArgs {
+    /// Run identifier.
+    pub run_id: String,
+    /// Follow the log stream.
+    #[arg(long)]
+    pub follow: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct GcArgs {
+    /// Only reap groups older than this (e.g. `24h`).
+    #[arg(long, default_value = "24h")]
+    pub older_than: String,
+    /// Show what would be reaped without deleting.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Do not prompt for confirmation.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+/// Session subcommands.
+#[derive(Debug, Subcommand)]
+pub enum SessionCommand {
+    /// Create an interactive GPU session.
+    Create(SessionCreateArgs),
+    /// List active sessions.
+    Ls(ReadArgs),
+    /// Run a command in a session (exit code is propagated).
+    Exec(SessionExecArgs),
+    /// Copy files to/from a session.
+    Cp(SessionCpArgs),
+    /// Show a session's logs.
+    Logs(SessionLogsArgs),
+    /// Stop a session (billing ends).
+    Stop(SessionNameArgs),
+    /// Remove a session's group.
+    Rm(SessionNameArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SessionCreateArgs {
+    /// Profile name.
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// Image reference (overrides the profile).
+    #[arg(long)]
+    pub image: Option<String>,
+    /// GPU class name or UUID (repeatable; overrides the profile).
+    #[arg(long = "gpu-class")]
+    pub gpu_classes: Vec<String>,
+    /// Priority tier (`high|medium|low|batch`; overrides the profile).
+    #[arg(long)]
+    pub priority: Option<String>,
+    /// Maximum session duration (e.g. `4h`).
+    #[arg(long, default_value = "4h")]
+    pub max_duration: String,
+    /// Deadman idle timeout (e.g. `15m`).
+    #[arg(long, default_value = "15m")]
+    pub deadman: String,
+    /// Session name.
+    #[arg(long)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SessionNameArgs {
+    /// Session name.
+    pub name: String,
+}
+
+#[derive(Debug, Args)]
+pub struct SessionExecArgs {
+    /// Session name.
+    pub name: String,
+    /// The command to run (after `--`).
+    #[arg(last = true, required = true)]
+    pub command: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SessionCpArgs {
+    /// Source (`NAME:PATH` or a local path).
+    pub source: String,
+    /// Destination (`NAME:PATH` or a local path).
+    pub dest: String,
+    /// Transfer chunk size (e.g. `32M`).
+    #[arg(long, default_value = "32M")]
+    pub chunk_size: String,
+}
+
+#[derive(Debug, Args)]
+pub struct SessionLogsArgs {
+    /// Session name.
+    pub name: String,
+    /// Specific exec id.
+    pub exec_id: Option<String>,
+}
+
+/// Serve subcommands.
+#[derive(Debug, Subcommand)]
+pub enum ServeCommand {
+    /// Bring up an inference service.
+    Up(ServeUpArgs),
+    /// Show a service's status and gateway URL.
+    Status(SessionNameArgs),
+    /// Foreground watchdog that stops the service when idle.
+    Autostop(ServeAutostopArgs),
+    /// Stop a service.
+    Down(SessionNameArgs),
+    /// Restart a stopped service.
+    Resume(SessionNameArgs),
+    /// Remove a service's group.
+    Rm(SessionNameArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ServeUpArgs {
+    /// Profile name.
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// Image reference (overrides the profile).
+    #[arg(long)]
+    pub image: Option<String>,
+    /// GPU class name or UUID (repeatable; overrides the profile).
+    #[arg(long = "gpu-class")]
+    pub gpu_classes: Vec<String>,
+    /// Priority tier (`high|medium|low|batch`; overrides the profile).
+    #[arg(long)]
+    pub priority: Option<String>,
+    /// Service name.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Maximum service duration (e.g. `4h`).
+    #[arg(long, default_value = "4h")]
+    pub max_duration: String,
+    /// The app's listen port inside the container.
+    #[arg(long)]
+    pub app_port: u16,
+    /// The command to run (after `--`).
+    #[arg(last = true, required = true)]
+    pub command: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ServeAutostopArgs {
+    /// Service name.
+    pub name: String,
+    /// Stop after this idle period (e.g. `30m`).
+    #[arg(long, default_value = "30m")]
+    pub idle_timeout: String,
+}
+
+/// Bench subcommands.
+#[derive(Debug, Subcommand)]
+pub enum BenchCommand {
+    /// Measure cold-start times for a class/image.
+    Startup(BenchStartupArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct BenchStartupArgs {
+    /// GPU class name or UUID.
+    #[arg(long)]
+    pub gpu_class: String,
+    /// Image reference.
+    #[arg(long)]
+    pub image: Option<String>,
+    /// Number of samples.
+    #[arg(short = 'n', long, default_value_t = 5)]
+    pub count: u32,
+    /// Priority tier.
+    #[arg(long, default_value = "batch")]
+    pub priority: String,
+}
+
+/// Image subcommands.
+#[derive(Debug, Subcommand)]
+pub enum ImageCommand {
+    /// Build and push a GPU image, recording its digest.
+    Push(ImagePushArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ImagePushArgs {
+    /// Image name (a `saladfingers.images.<name>`).
+    pub name: String,
+    /// Tag to push (the recorded lockfile ref is always digest-pinned).
+    #[arg(long, default_value = "latest")]
+    pub tag: String,
+    /// Emit JSON instead of a table.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct GpuProbeArgs {
+    /// GPU class name or UUID to probe on.
+    #[arg(long, default_value = "rtx3060")]
+    pub gpu_class: String,
+    /// Probe image ref (else `SALADFINGERS_PROBE_IMAGE`).
+    #[arg(long)]
+    pub image: Option<String>,
+    /// Emit JSON instead of a table.
+    #[arg(long)]
+    pub json: bool,
+}

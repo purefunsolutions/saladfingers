@@ -1,0 +1,61 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Mika Tammi / Pure Fun Solutions
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR BSD-3-Clause
+
+[package]
+name = "saladfingers-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "sf-agent: the in-container agent baked into every saladfingers image."
+
+[[bin]]
+name = "sf-agent"
+path = "src/main.rs"
+
+[dependencies]
+saladfingers-protocol = { workspace = true }
+saladfingers-api = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true, features = [
+  "rt-multi-thread",
+  "macros",
+  "process",
+  "signal",
+  "net",
+  "time",
+  "sync",
+  "fs",
+  "io-util",
+] }
+reqwest = { workspace = true }
+axum = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+bytes = { workspace = true }
+libc = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+futures-util = { workspace = true }
+getrandom = { workspace = true }
+glob = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = [
+  "rt-multi-thread",
+  "macros",
+  "process",
+  "time",
+  "net",
+] }
+wiremock = { workspace = true }
+tempfile = { workspace = true }
+axum = { workspace = true }
+reqwest = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
