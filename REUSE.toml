@@ -10,6 +10,13 @@ precedence = "aggregate"
 SPDX-FileCopyrightText = "Copyright (C) 2026 Mika Tammi / Pure Fun Solutions"
 SPDX-License-Identifier = "MIT OR Apache-2.0 OR BSD-3-Clause"
 
+# Binary image assets cannot carry inline SPDX headers.
+[[annotations]]
+path = "assets/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "Copyright (C) 2026 Mika Tammi / Pure Fun Solutions"
+SPDX-License-Identifier = "MIT OR Apache-2.0 OR BSD-3-Clause"
+
 # Vendored third-party OpenAPI specs from SaladCloud — do not inject our headers.
 # salad-cloud.yaml and salad-cloud-imds.yaml declare "license: MIT" inline; s4.yaml is a
 # byte-for-byte copy of SaladTechnologies/storage-service/openapi.yml, which is MIT-licensed.
