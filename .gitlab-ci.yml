@@ -21,14 +21,31 @@ ci-image:
 #   interruptible: true
 #   script:
 #     - nix build -L .#packages.aarch64-darwin.default
-# Mirror master to the public GitHub repository. GITHUB_MIRROR_URL is a masked CI
-# variable (never in this file, which itself gets mirrored).
+# Mirror master to the public GitHub repository. Lives in the publish stage, so it
+# only runs once the ci stage is green — a broken master never reaches GitHub.
+#
+# GITHUB_DEPLOY_KEY_B64 is a masked+protected CI variable holding `base64 -w0` of an
+# ed25519 private key whose public half is a write-enabled deploy key on the GitHub
+# repo. The remote URL and GitHub's host key are public, so they belong in this file
+# (which itself gets mirrored); only the private key is a secret.
 publish-github:
   stage: publish
   interruptible: false
+  resource_group: github-mirror
   variables:
     GIT_DEPTH: "0"
+    GITHUB_REMOTE: "git@github.com:purefunsolutions/saladfingers.git"
   rules:
     - if: '$CI_COMMIT_BRANCH == "master"'
   script:
-    - git push "$GITHUB_MIRROR_URL" "HEAD:master" --tags
+    - install -d -m700 "$HOME/.sf-mirror"
+    - printf '%s' "$GITHUB_DEPLOY_KEY_B64" | base64 -d > "$HOME/.sf-mirror/key"
+    - chmod 600 "$HOME/.sf-mirror/key"
+    # GitHub's published ed25519 host key; refresh from https://api.github.com/meta.
+    - echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > "$HOME/.sf-mirror/known_hosts"
+    # The runner only fetches the pipeline ref and the branch, so no tags are present
+    # locally — without this, --tags below is a silent no-op.
+    - git fetch --no-recurse-submodules origin '+refs/tags/*:refs/tags/*'
+    - git -c core.sshCommand="ssh -i $HOME/.sf-mirror/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.sf-mirror/known_hosts -o StrictHostKeyChecking=yes" push "$GITHUB_REMOTE" HEAD:master --tags
+  after_script:
+    - rm -rf "$HOME/.sf-mirror"
