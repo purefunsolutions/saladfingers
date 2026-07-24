@@ -1,0 +1,54 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Mika Tammi / Pure Fun Solutions
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR BSD-3-Clause
+
+[package]
+name = "saladfingers-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Shared wire contract between the saladfingers CLI and the in-container sf-agent."
+
+[features]
+default = ["transfer"]
+# The tar+zstd part-series transfer engine (compress/split/upload/download over
+# presigned URLs). Both the CLI and the agent enable it.
+transfer = [
+  "dep:sha2",
+  "dep:tar",
+  "dep:zstd",
+  "dep:reqwest",
+  "dep:tokio",
+  "dep:tokio-util",
+  "dep:futures-util",
+  "dep:bytes",
+  "dep:anyhow",
+  "dep:tempfile",
+  "dep:tracing",
+]
+
+[dependencies]
+serde = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true, optional = true }
+tar = { workspace = true, optional = true }
+zstd = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = [
+  "fs",
+  "io-util",
+  "rt",
+  "time",
+] }
+tokio-util = { workspace = true, optional = true, features = ["io"] }
+futures-util = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+axum = { workspace = true }

@@ -1,0 +1,20 @@
+version = 1
+SPDX-PackageName = "saladfingers"
+SPDX-PackageSupplier = "Mika Tammi / Pure Fun Solutions <mikatammi@gmail.com>"
+SPDX-PackageDownloadLocation = "https://gitlab.purefun.fi/purefun/saladfingers"
+
+# Generated lockfiles — cannot carry a durable inline header.
+[[annotations]]
+path = ["Cargo.lock", "flake.lock"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "Copyright (C) 2026 Mika Tammi / Pure Fun Solutions"
+SPDX-License-Identifier = "MIT OR Apache-2.0 OR BSD-3-Clause"
+
+# Vendored third-party OpenAPI specs from SaladCloud — do not inject our headers.
+# salad-cloud.yaml and salad-cloud-imds.yaml declare "license: MIT" inline; s4.yaml is a
+# byte-for-byte copy of SaladTechnologies/storage-service/openapi.yml, which is MIT-licensed.
+[[annotations]]
+path = "docs/reference/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "Salad Technologies, Inc."
+SPDX-License-Identifier = "MIT"

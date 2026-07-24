@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Mika Tammi / Pure Fun Solutions
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR BSD-3-Clause
+
+/target
+/result
+/result-*
+.direnv/
+*.local.toml
+/sf-out/
+/.claude/
+PLAN.md
+saladfingers-images.lock
