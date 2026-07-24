@@ -46,6 +46,8 @@ publish-github:
     # The runner only fetches the pipeline ref and the branch, so no tags are present
     # locally — without this, --tags below is a silent no-op.
     - git fetch --no-recurse-submodules origin '+refs/tags/*:refs/tags/*'
-    - git -c core.sshCommand="ssh -i $HOME/.sf-mirror/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.sf-mirror/known_hosts -o StrictHostKeyChecking=yes" push "$GITHUB_REMOTE" HEAD:master --tags
+    # refs/heads/ spelled out: the runner pushes a detached HEAD into a repo that
+    # starts out empty, so git cannot infer the ref type on either side.
+    - git -c core.sshCommand="ssh -i $HOME/.sf-mirror/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.sf-mirror/known_hosts -o StrictHostKeyChecking=yes" push "$GITHUB_REMOTE" HEAD:refs/heads/master --tags
   after_script:
     - rm -rf "$HOME/.sf-mirror"
