@@ -467,6 +467,13 @@ pub(crate) fn spawn_reaper(run_id: &str, org: &str, project: &str) -> Result<()>
 const ENV_VALUE_MAX: usize = 960;
 /// The agent reassembles `SF_JOB_URL` + `SF_JOB_URL_1..=9` (ten segments max).
 const JOB_URL_MAX_PARTS: usize = 10;
+/// How long to let an envelope arrive after the group looks finished or gone. The agent
+/// writes its envelope and the group disappears moments later, so the two can cross.
+const ENVELOPE_GRACE: Duration = Duration::from_secs(5);
+/// Consecutive 404s tolerated before a never-yet-seen group counts as gone (~1 minute at
+/// the poll interval). Only creation lag justifies waiting at all; a group that existed
+/// and then 404s is deleted, and no amount of waiting brings it back.
+const MISSING_GROUP_TOLERANCE: u32 = 6;
 
 /// The container environment for one shard's `sf-agent run`.
 ///
@@ -599,6 +606,13 @@ async fn await_and_collect(
                 eprintln!("  shard {shard}: group failed (no envelope) — keeping it for forensics");
                 print_system_logs(client, &name).await;
             }
+            ShardOutcome::Vanished => {
+                worst = worst.max(1);
+                eprintln!(
+                    "  shard {shard}: container group no longer exists (cancelled, reaped, or \
+                     deleted elsewhere) and no result was written"
+                );
+            }
         }
         shard_spans.push(spans);
     }
@@ -691,6 +705,8 @@ fn finalize_run(
 enum ShardOutcome {
     Envelope(Box<ResultEnvelope>),
     Failed,
+    /// The container group is gone from the control plane and no envelope ever appeared.
+    Vanished,
 }
 
 /// Accumulates per-machine running spans for one shard as the poll loop observes the
@@ -797,6 +813,18 @@ impl SpanTracker {
     }
 }
 
+/// Whether a 404 on the polled group should end the wait.
+///
+/// A group the control plane has already acknowledged can only 404 because it was
+/// deleted — by `cancel`, by the reaper, or by hand — and a deleted group never comes
+/// back, never runs, and never writes a result. Waiting on one is pure billing-clock and
+/// operator time. The single case that deserves patience is the opposite one: a group so
+/// newly created that it is not visible yet, which is why a never-yet-seen group gets a
+/// bounded number of retries before the same verdict.
+const fn group_is_gone(seen_group: bool, missing_polls: u32) -> bool {
+    seen_group || missing_polls >= MISSING_GROUP_TOLERANCE
+}
+
 /// The `machine_id` of the instance currently in `running`, if any. A shard group is
 /// single-replica, so there is at most one instance.
 fn running_machine_id(instances: &[Instance]) -> Option<String> {
@@ -823,6 +851,10 @@ async fn await_shard(
     let start = Instant::now();
     let mut last = String::new();
     let mut tracker = SpanTracker::default();
+    // Whether the control plane has ever acknowledged this group. Once it has, a later
+    // 404 can only mean deletion; before that it may still be a creation not yet visible.
+    let mut seen_group = false;
+    let mut missing_polls = 0u32;
     // Adopt spans a previous process already observed (attach after a crash/detach),
     // so its billed time survives into the final estimate instead of being overwritten.
     if let Ok(Some(run)) = state::load_run(run_id)
@@ -840,8 +872,33 @@ async fn await_shard(
         // A transient control-plane error must not abandon a live, billing run: log it and
         // keep polling (like `list_instances` below). The hard cap still bounds a run whose
         // control plane is genuinely, persistently unreachable.
+        //
+        // A 404 is different in kind: the group is *gone*, so nothing will ever run under
+        // that name again and no envelope can appear. Treating it as transient made the
+        // CLI poll a cancelled run ~400 times over 70 minutes before the hard cap fired —
+        // for a deletion it had performed itself.
         let status = match client.get_container_group(&name).await {
-            Ok(group) => group.status().unwrap_or(GroupStatus::Unknown),
+            Ok(group) => {
+                seen_group = true;
+                group.status().unwrap_or(GroupStatus::Unknown)
+            }
+            Err(e) if e.is_not_found() => {
+                missing_polls += 1;
+                // Two races argue against bailing on the first 404, so give each a grace:
+                // the job may have finished and had its group reaped between our envelope
+                // check and this poll, and a just-created group may not be visible yet.
+                tokio::time::sleep(ENVELOPE_GRACE).await;
+                if let Ok(Some(env)) = fetch_envelope(http, &result_get).await {
+                    tracker.finalize_with_envelope(&env);
+                    return Ok((ShardOutcome::Envelope(Box::new(env)), tracker.into_spans()));
+                }
+                if group_is_gone(seen_group, missing_polls) {
+                    tracker.close();
+                    tracing::warn!("container group {name} is gone and wrote no result");
+                    return Ok((ShardOutcome::Vanished, tracker.into_spans()));
+                }
+                GroupStatus::Unknown
+            }
             Err(e) => {
                 tracing::warn!("poll of {name} failed: {e:#}; retrying");
                 GroupStatus::Unknown
@@ -864,7 +921,7 @@ async fn await_shard(
         }
         if matches!(status, GroupStatus::Failed) {
             // Grace: the envelope may still be arriving.
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(ENVELOPE_GRACE).await;
             if let Ok(Some(env)) = fetch_envelope(http, &result_get).await {
                 tracker.finalize_with_envelope(&env);
                 return Ok((ShardOutcome::Envelope(Box::new(env)), tracker.into_spans()));
@@ -1286,6 +1343,22 @@ fn save_state(cfg: &Config, run_id: &str, params: &RunParams, groups: &[GroupRef
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_deleted_group_ends_the_wait_immediately() {
+        // Seen once, then gone: cancelled or reaped. Nothing will run under that name
+        // again, so the first 404 is the answer — this is the case that used to poll a
+        // dead group for over an hour.
+        assert!(group_is_gone(true, 1));
+    }
+
+    #[test]
+    fn a_group_never_yet_seen_gets_a_bounded_grace() {
+        // Creation may not be visible yet, so tolerate a while — but not forever.
+        assert!(!group_is_gone(false, 1));
+        assert!(!group_is_gone(false, MISSING_GROUP_TOLERANCE - 1));
+        assert!(group_is_gone(false, MISSING_GROUP_TOLERANCE));
+    }
 
     fn timings_at(start: DateTime<Utc>, exec_end_secs: i64, with_outputs: bool) -> Timings {
         Timings {
