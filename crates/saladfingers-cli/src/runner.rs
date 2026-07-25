@@ -1078,6 +1078,7 @@ async fn fetch_envelope(http: &reqwest::Client, url: &str) -> Result<Option<Resu
     // can turn a poll failure into a leaked capability.
     let resp = http
         .get(url)
+        .timeout(transfer::CONTROL_TIMEOUT)
         .send()
         .await
         .map_err(reqwest::Error::without_url)?;
@@ -1093,6 +1094,7 @@ async fn put_object(http: &reqwest::Client, url: &str, body: Vec<u8>) -> Result<
     // text. This error propagates out of `run`, and `main` returns `anyhow::Result`, so
     // `Termination` prints it with `Debug` — the whole source chain — into stderr/CI logs.
     http.put(url)
+        .timeout(transfer::CONTROL_TIMEOUT)
         .body(body)
         .send()
         .await

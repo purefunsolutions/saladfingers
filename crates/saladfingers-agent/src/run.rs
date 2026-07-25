@@ -641,6 +641,7 @@ async fn put_attempts(http: &reqwest::Client, url: &str, attempts: &Attempts) {
     if let Ok(body) = serde_json::to_vec(attempts) {
         let _ = http
             .put(url)
+            .timeout(transfer::CONTROL_TIMEOUT)
             .header(CONTENT_TYPE, "application/json")
             .body(body)
             .send()
@@ -655,6 +656,7 @@ async fn fetch_json<T: serde::de::DeserializeOwned>(
     // `without_url`: the URL is presigned; its signature must not reach logs.
     let resp = http
         .get(url)
+        .timeout(transfer::CONTROL_TIMEOUT)
         .send()
         .await
         .map_err(reqwest::Error::without_url)?;
@@ -700,6 +702,7 @@ async fn put_envelope(http: &reqwest::Client, url: &str, env: &ResultEnvelope) -
     for attempt in 1u32..=3 {
         let result = http
             .put(url)
+            .timeout(transfer::CONTROL_TIMEOUT)
             .header(CONTENT_TYPE, "application/json")
             .body(body.clone())
             .send()

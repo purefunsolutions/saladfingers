@@ -68,6 +68,7 @@ pub async fn restore(http: &reqwest::Client, spec: &JobSpec) -> Result<()> {
     tokio::fs::create_dir_all(&dir).await.ok();
     let resp = http
         .get(&ckpt.meta_get_url)
+        .timeout(transfer::CONTROL_TIMEOUT)
         .send()
         .await
         .map_err(reqwest::Error::without_url)
@@ -192,6 +193,7 @@ async fn upload(http: &reqwest::Client, ckpt: &CheckpointSpec, dir: &Path) -> Re
     };
     // `without_url`: the meta URL is presigned; keep its signature out of warn logs.
     http.put(&ckpt.meta_put_url)
+        .timeout(transfer::CONTROL_TIMEOUT)
         .json(&meta)
         .send()
         .await
