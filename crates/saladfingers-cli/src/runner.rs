@@ -1139,6 +1139,26 @@ fn summary(
     print_table(&t);
 }
 
+/// Host RAM in GiB when neither the flag nor the profile names one.
+const DEFAULT_MEMORY_GB: u32 = 16;
+
+/// Host RAM in MiB from a GiB figure.
+///
+/// The multiplication is checked because the product is a `u32` and 4194304 GiB
+/// overflows it: a debug build panics, and a release build — the one that ships —
+/// silently requests **0 MiB**, while a fat-fingered extra zero wraps to some
+/// unrelated size. A flag whose entire purpose is to prevent a silent OOM must not
+/// have a silent failure of its own. The profile's `memory_gb` comes through here too.
+fn memory_mb(gib: Option<u32>) -> Result<u32> {
+    let gib = gib.unwrap_or(DEFAULT_MEMORY_GB);
+    gib.checked_mul(1024).with_context(|| {
+        format!(
+            "memory of {gib} GiB is out of range (at most {} GiB)",
+            u32::MAX / 1024
+        )
+    })
+}
+
 fn resolve_params(cfg: &Config, profile: Option<&Profile>, args: &RunArgs) -> Result<RunParams> {
     let image = crate::image::resolve_deploy_image(
         args.image.as_deref(),
@@ -1238,7 +1258,11 @@ fn resolve_params(cfg: &Config, profile: Option<&Profile>, args: &RunArgs) -> Re
         image,
         gpu_classes,
         cpu: profile.and_then(|p| p.cpu).unwrap_or(8),
-        memory_mb: profile.and_then(|p| p.memory_gb).unwrap_or(16) * 1024,
+        // An explicit --memory-gb beats the profile, the same rule --replicas
+        // uses below. HOST RAM, not VRAM: too little and the host OOM-kills
+        // the container with exit 137, and a benchmark restarted mid-flight
+        // then reports degraded numbers that look entirely ordinary.
+        memory_mb: memory_mb(args.memory_gb.or_else(|| profile.and_then(|p| p.memory_gb)))?,
         disk_gib: profile.and_then(|p| p.disk_gb).unwrap_or(20) + 5, // spool headroom
         shm_mb: profile.and_then(|p| p.shm_mb),
         priority,
@@ -1358,6 +1382,102 @@ mod tests {
         assert!(!group_is_gone(false, 1));
         assert!(!group_is_gone(false, MISSING_GROUP_TOLERANCE - 1));
         assert!(group_is_gone(false, MISSING_GROUP_TOLERANCE));
+    }
+
+    /// A `Config` with nothing configured — the parts `resolve_params` reads are
+    /// the defaults and the profile, not the org/key/storage.
+    pub(super) fn bare_config() -> Config {
+        Config {
+            organization: "org".into(),
+            project: "proj".into(),
+            api_key: saladfingers_api::Secret::new("k"),
+            storage: None,
+            registry: None,
+            defaults: crate::config::Defaults::default(),
+            profiles: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// `RunArgs` as clap would build it, so the flag's own wiring is under test
+    /// too — a `--memory-gb` that never reaches `RunArgs` would satisfy any
+    /// hand-constructed struct.
+    pub(super) fn run_args(extra: &[&str]) -> RunArgs {
+        // `example.invalid` cannot appear in a lockfile, so image resolution is
+        // a pass-through and this test does not depend on the working tree.
+        let mut argv = vec![
+            "saladfingers",
+            "run",
+            "--image",
+            "example.invalid/img:t",
+            "--gpu-class",
+            "rtx 4090 (24 gb)",
+        ];
+        argv.extend_from_slice(extra);
+        argv.extend_from_slice(&["--", "true"]); // `run` requires a command
+        use clap::Parser as _;
+        match crate::cli::Cli::parse_from(argv).command {
+            crate::cli::Command::Run(args) => args,
+            other => panic!("expected `run`, parsed {other:?}"),
+        }
+    }
+
+    /// `--memory-gb` overrides the profile in BOTH directions.
+    ///
+    /// The direction that matters is DOWN, and it is the one a `max()` would get
+    /// wrong — the bug `--replicas` carried, where a profile could only ever be
+    /// raised. Getting this wrong is quiet: too little host RAM and the host
+    /// OOM-kills the container (exit 137), the platform restarts it, and a
+    /// benchmark killed mid-flight reports degraded numbers that look ordinary.
+    #[test]
+    fn memory_gb_overrides_the_profile_in_both_directions() {
+        let cfg = bare_config();
+        let mem = |profile_gb: Option<u32>, flag: &[&str]| {
+            let profile = profile_gb.map(|gb| Profile {
+                memory_gb: Some(gb),
+                ..Profile::default()
+            });
+            resolve_params(&cfg, profile.as_ref(), &run_args(flag))
+                .expect("resolve_params")
+                .memory_mb
+        };
+
+        assert_eq!(
+            mem(None, &[]),
+            DEFAULT_MEMORY_GB * 1024,
+            "neither: the 16 GiB default"
+        );
+        assert_eq!(mem(Some(40), &[]), 40 * 1024, "profile alone applies");
+        assert_eq!(mem(None, &["--memory-gb", "40"]), 40 * 1024, "flag alone");
+        assert_eq!(
+            mem(Some(80), &["--memory-gb", "40"]),
+            40 * 1024,
+            "the flag must LOWER the profile too, not just raise it"
+        );
+        assert_eq!(
+            mem(Some(8), &["--memory-gb", "40"]),
+            40 * 1024,
+            "and raise it"
+        );
+    }
+
+    /// A GiB figure that overflows `u32` MiB must be an error, not a silent 0.
+    ///
+    /// Release builds do not check arithmetic, so before this the shipping binary
+    /// turned `--memory-gb 4194304` into a request for **0 MiB** and a
+    /// fat-fingered extra zero into some unrelated size, while debug builds
+    /// panicked outright.
+    #[test]
+    fn memory_out_of_range_is_an_error_not_a_wrapped_size() {
+        assert_eq!(memory_mb(None).unwrap(), DEFAULT_MEMORY_GB * 1024);
+        assert_eq!(memory_mb(Some(40)).unwrap(), 40 * 1024);
+        // The largest representable figure still works...
+        assert_eq!(memory_mb(Some(u32::MAX / 1024)).unwrap(), 4_294_966_272);
+        // ...and one more GiB is refused, by name.
+        let e = memory_mb(Some(u32::MAX / 1024 + 1))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("out of range"), "{e}");
+        assert!(memory_mb(Some(40_000_000)).is_err(), "a fat-fingered zero");
     }
 
     fn timings_at(start: DateTime<Utc>, exec_end_secs: i64, with_outputs: bool) -> Timings {
