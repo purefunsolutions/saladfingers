@@ -41,6 +41,91 @@ const REGISTRY_REF_ENV: &str = "SALADFINGERS_REGISTRY_REF";
 const PUSH_USER_ENV: &str = "SALADFINGERS_REGISTRY_PUSH_USER";
 /// Conventional env var holding the push password/token directly.
 const PUSH_PASS_ENV: &str = "SALADFINGERS_REGISTRY_PUSH_PASS";
+/// Layer compression for the push: `gzip` (default), `none`, or — only via the
+/// long spelling in [`ZSTD_ACKNOWLEDGED`] — zstd. Anything else is rejected.
+///
+/// **gzip is not a preference, it is a requirement: SaladCloud nodes cannot
+/// unpack zstd layers.** Measured by pushing one image both ways and deploying
+/// each to the same GPU class at batch: the `tar+gzip` copy reached `running` in
+/// 2 min 17 s, while the `tar+zstd` one never did, burning 10+ instances across
+/// 2 machines in 20 minutes on repeated `Instance Start Failure: Other`. It
+/// downloads fine and then fails to unpack, so the fault is the image rather
+/// than any one machine — and the event names nothing that points at
+/// compression, which makes it indistinguishable from flaky hardware and an
+/// expensive thing to rediscover. `docs/salad-facts.md` records the measurement;
+/// the failed run cost nothing, since only `running` bills.
+///
+/// What each setting produces, measured on a 1342 MiB CUDA image (that figure
+/// is the *uncompressed* layer bytes, i.e. what `none` sends):
+///
+/// | setting  | on the wire | compress time |
+/// |----------|-------------|---------------|
+/// | none     |    1342 MiB | –             |
+/// | gzip -9  |     756 MiB | 16 s          |
+/// | zstd     |     613 MiB | 59 s          |
+///
+/// Read that as a menu, not as a before/after: pushes were never raw. skopeo
+/// already gzips when copying to a registry, at the compressor's own default
+/// level — 798 MiB on the same image (see [`GZIP_MAX_LEVEL`]). So pinning this
+/// buys ~42 MiB per push, plus an off switch, plus the guarantee that a
+/// Salad-bound image is never accidentally zstd.
+///
+/// **These flags only govern layers the destination does not already hold.** A
+/// registry that already has a layer's blob gets it referenced, not re-uploaded,
+/// and the manifest then points at whatever compression that blob was *first*
+/// pushed with. Measured on the 58.7 MiB `gpu-probe` image: pushing it at `-9`
+/// over a registry copy made before this change produced a manifest in which 8
+/// of its 11 blobs were byte-identical to the old level-6 push, and only 3
+/// matched a fresh `-9` compression of the same image (which shares just 1 of 12
+/// blobs with a fresh level-6 one, so this is reuse, not the two levels
+/// coinciding). Changing the level or the format therefore takes full effect on
+/// layers new to that destination; to force it for the rest, push to a
+/// repository that does not already have them.
+///
+/// Two dead ends, recorded so nobody re-derives them:
+///
+///   * **The zstd level knob is coarse.** skopeo compresses with Go's
+///     klauspost/compress (pure Go — not the reference C library), whose
+///     `EncoderLevelFromZstd` folds numeric levels onto four speed tiers:
+///     levels 11, 15 and 22 all produced byte-identical output in the same
+///     59 s. The real C library at `-19 --ultra --long=27` reaches 541 MiB on
+///     the same bytes, 12% better than Go's best — but getting it would mean
+///     forking skopeo onto a cgo zstd binding.
+///   * **xz and bzip2 are not options.** skopeo has no xz compressor at all
+///     (`cannot find compressor for "xz"`), and while it recognises bzip2 the
+///     OCI spec defines no `+bzip2` layer media type, so the destination
+///     rejects it. gzip and zstd are the whole menu.
+const PUSH_COMPRESSION_ENV: &str = "SALADFINGERS_PUSH_COMPRESSION";
+/// Overrides the compression level (see [`PUSH_COMPRESSION_ENV`] for the format).
+const PUSH_COMPRESSION_LEVEL_ENV: &str = "SALADFINGERS_PUSH_COMPRESSION_LEVEL";
+/// Universally pullable, unlike zstd — which SaladCloud nodes cannot decompress.
+const DEFAULT_PUSH_COMPRESSION: &str = "gzip";
+/// The only spelling that selects zstd. A plain `zstd` is refused.
+///
+/// zstd is the better compressor and the worse outcome: the push succeeds, ~19%
+/// faster, and the image then cannot be started on any SaladCloud node. Every
+/// cost lands after the setting is out of sight — a full upload, then a
+/// reallocation loop indistinguishable from bad hardware — which is exactly the
+/// shape of mistake a short, guessable value invites.
+///
+/// So the acknowledgement is the value rather than a second variable: it is
+/// visible in the shell history, CI config, or script that sets it, where a
+/// separate `..._I_KNOW=1` two files away would not be. It also states the
+/// specific fact rather than generic bravado, so when SaladCloud does support
+/// zstd this name reads as false and it is obvious the gate should go: delete
+/// this constant and accept `"zstd"` in [`compression_args_from`].
+const ZSTD_ACKNOWLEDGED: &str = "zstd-salad-cannot-pull-this";
+/// Maximum gzip, and worth pinning: leaving the level unset is *not* "best
+/// effort". containers-image's gzipCompressor takes its `level == nil` branch,
+/// `pgzip.NewWriter` → `flate.DefaultCompression` (6), which measured 798 MiB
+/// where `-9` gives 756 MiB on the same image. Uploading runs at ~220 KiB/s
+/// against a compressor doing tens of MB/s, so the highest level is
+/// unconditionally the right trade — gzip is never the bottleneck.
+const GZIP_MAX_LEVEL: &str = "9";
+/// zstd's *tier* selector, not a literal level: klauspost quantizes everything
+/// from 10 upwards onto its top tier, and the 613 MiB above was measured there.
+/// A plain 9 would land one tier below it and quietly miss that number.
+const ZSTD_BEST_TIER_LEVEL: &str = "19";
 /// Env var overriding the flake system images are built under (default below).
 const IMAGE_SYSTEM_ENV: &str = "SALADFINGERS_IMAGE_SYSTEM";
 /// Images are linux/amd64 only and defined under this system in `nix/images.nix`,
@@ -77,6 +162,9 @@ type Lockfile = BTreeMap<String, LockEntry>;
 pub fn push(cfg: Config, args: ImagePushArgs) -> Result<()> {
     let base = resolve_registry_base(&cfg)?;
     let host = registry_host(&base)?;
+    // Resolved up front: a rejected compression setting must fail here, not after
+    // an authentication and however much of a multi-GB upload.
+    let compression = compression_args()?;
     let (user, pass) = resolve_push_credentials(cfg.registry.as_ref())?;
 
     let tagged_ref = tagged_ref(&base, &args.name, &args.tag);
@@ -106,6 +194,7 @@ pub fn push(cfg: Config, args: ImagePushArgs) -> Result<()> {
         &tagged_ref,
         &digestfile,
         &authfile,
+        &compression,
     )?;
 
     let digest = read_digest(&digestfile)?;
@@ -287,8 +376,68 @@ fn skopeo_login(host: &str, user: &str, pass: &str, authfile: &Path) -> Result<(
     Ok(())
 }
 
+/// The skopeo flags that pin layer compression, or empty for
+/// `SALADFINGERS_PUSH_COMPRESSION=none`.
+///
+/// A function rather than flags inlined at the call site, so that every push path
+/// gets them by construction — a path that forgets them sends whatever skopeo
+/// defaults to, which is the one outcome [`PUSH_COMPRESSION_ENV`] exists to rule out.
+///
+/// # Errors
+/// Returns an error for an unrecognised format, and for a bare `zstd` — see
+/// [`ZSTD_ACKNOWLEDGED`].
+fn compression_args() -> Result<Vec<String>> {
+    compression_args_from(&non_empty_env)
+}
+
+/// Pure form of [`compression_args`]; `env` is the environment lookup (real env in
+/// production, a fake map in tests), the same seam [`pick_credential`] uses.
+fn compression_args_from(env: &impl Fn(&str) -> Option<String>) -> Result<Vec<String>> {
+    let requested =
+        env(PUSH_COMPRESSION_ENV).unwrap_or_else(|| DEFAULT_PUSH_COMPRESSION.to_string());
+    let format = match requested.as_str() {
+        // Raw: slow to upload, but every node can start it.
+        "none" => return Ok(Vec::new()),
+        "gzip" => "gzip",
+        ZSTD_ACKNOWLEDGED => "zstd",
+        "zstd" => bail!(
+            "{PUSH_COMPRESSION_ENV}=zstd refused: SaladCloud nodes cannot unpack zstd \
+             layers. The push itself would succeed — and then every run of this image \
+             would loop forever on \"Instance Start Failure: Other\", reallocating across \
+             node after node, which looks exactly like flaky hardware and says nothing \
+             about compression. If this image is not bound for SaladCloud, set \
+             {PUSH_COMPRESSION_ENV}={ZSTD_ACKNOWLEDGED}."
+        ),
+        other => bail!(
+            "{PUSH_COMPRESSION_ENV}={other:?} is not a format skopeo can produce — it \
+             offers only gzip and zstd (no xz, and no OCI media type for bzip2). Use \
+             `gzip` (the default), `none`, or `{ZSTD_ACKNOWLEDGED}`."
+        ),
+    };
+    let level = env(PUSH_COMPRESSION_LEVEL_ENV).unwrap_or_else(|| {
+        if format == "gzip" {
+            GZIP_MAX_LEVEL
+        } else {
+            ZSTD_BEST_TIER_LEVEL
+        }
+        .to_string()
+    });
+    // `--dest-force-compress-format` is the operative flag: without it skopeo keeps
+    // the source layers as they are and the requested format is a no-op.
+    Ok(vec![
+        "--dest-compress-format".to_string(),
+        format.to_string(),
+        "--dest-compress-level".to_string(),
+        level,
+        "--dest-force-compress-format".to_string(),
+    ])
+}
+
 /// Build and push the image via its nix2container `.copyTo` app, writing the pushed
 /// digest to `digestfile`. Inherits stdio so nix build/push progress is visible.
+///
+/// `compression` comes from [`compression_args`], resolved by the caller so an
+/// unusable setting is rejected before anything is authenticated or uploaded.
 fn run_copy_to(
     root: &Path,
     system: &str,
@@ -296,6 +445,7 @@ fn run_copy_to(
     tagged_ref: &str,
     digestfile: &Path,
     authfile: &Path,
+    compression: &[String],
 ) -> Result<()> {
     let attr = format!("{}#packages.{system}.{name}-image.copyTo", root.display());
     let status = Command::new("nix")
@@ -307,6 +457,7 @@ fn run_copy_to(
         .arg(digestfile)
         .arg("--authfile")
         .arg(authfile)
+        .args(compression)
         .current_dir(root)
         .status()
         .context("spawning `nix run … copyTo` (is nix on PATH?)")?;
@@ -667,6 +818,119 @@ mod tests {
         );
         // Nothing configured → None.
         assert_eq!(pick_credential(None, "UNSET_CONV", None, &lookup), None);
+    }
+
+    /// Build the env lookup the compression tests share.
+    fn env_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    /// The whole point of the setting: a push must never be left to whatever
+    /// skopeo defaults to, and must never reach SaladCloud as zstd by accident.
+    #[test]
+    fn compression_defaults_to_forced_gzip_9() {
+        let env = env_of(&[]);
+        let args = compression_args_from(&|k: &str| env.get(k).cloned()).unwrap();
+        assert_eq!(
+            args,
+            [
+                "--dest-compress-format",
+                "gzip",
+                "--dest-compress-level",
+                "9",
+                "--dest-force-compress-format",
+            ]
+        );
+    }
+
+    /// `--dest-force-compress-format` is what makes the format take effect at
+    /// all, so it must be present whenever anything else is.
+    #[test]
+    fn compression_is_all_or_nothing() {
+        let off = env_of(&[(PUSH_COMPRESSION_ENV, "none")]);
+        assert!(
+            compression_args_from(&|k: &str| off.get(k).cloned())
+                .unwrap()
+                .is_empty(),
+            "`none` must send no compression flags at all"
+        );
+
+        // Even with a level set, `none` stays off rather than half-applying it.
+        let off_with_level = env_of(&[
+            (PUSH_COMPRESSION_ENV, "none"),
+            (PUSH_COMPRESSION_LEVEL_ENV, "9"),
+        ]);
+        assert!(
+            compression_args_from(&|k: &str| off_with_level.get(k).cloned())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A bare `zstd` is the guessable spelling and the expensive mistake, so it
+    /// is refused rather than obeyed — and the refusal has to hand over the
+    /// exact value that works, or it is just an obstacle.
+    #[test]
+    fn bare_zstd_is_refused_and_names_the_way_through() {
+        let env = env_of(&[(PUSH_COMPRESSION_ENV, "zstd")]);
+        let err = compression_args_from(&|k: &str| env.get(k).cloned())
+            .expect_err("a bare `zstd` must not push")
+            .to_string();
+        assert!(err.contains(ZSTD_ACKNOWLEDGED), "{err}");
+        // The reason, not just the rule: this is what the operator has to weigh.
+        assert!(err.contains("cannot unpack zstd"), "{err}");
+    }
+
+    /// Acknowledged zstd pushes as zstd — the gate refuses a spelling, not the
+    /// format. Level 19, not gzip's 9: klauspost folds numeric levels onto four
+    /// speed tiers with the top one starting at 10, so a shared `9` would drop
+    /// the push a tier below the 613 MiB figure `docs/registry.md` quotes.
+    #[test]
+    fn acknowledged_zstd_pushes_zstd_in_its_top_tier() {
+        let env = env_of(&[(PUSH_COMPRESSION_ENV, ZSTD_ACKNOWLEDGED)]);
+        let args = compression_args_from(&|k: &str| env.get(k).cloned()).unwrap();
+        assert_eq!(
+            args,
+            [
+                "--dest-compress-format",
+                "zstd",
+                "--dest-compress-level",
+                "19",
+                "--dest-force-compress-format",
+            ],
+            "the acknowledgement must reach skopeo as plain `zstd`, at its top tier"
+        );
+    }
+
+    /// A typo must not reach skopeo and fail there, several seconds and one
+    /// authentication later, in its vocabulary rather than ours.
+    #[test]
+    fn an_unknown_format_is_rejected_up_front() {
+        // The last one is a near-miss of the acknowledgement: matching is exact,
+        // so a half-remembered spelling fails loudly rather than falling back.
+        for bad in ["gzipp", "xz", "bzip2", "ZSTD", "zstd-salad-cannot-pull-it"] {
+            let env = env_of(&[(PUSH_COMPRESSION_ENV, bad)]);
+            assert!(
+                compression_args_from(&|k: &str| env.get(k).cloned()).is_err(),
+                "{bad:?} must be rejected here, not handed to skopeo"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_level_overrides_both_defaults() {
+        for (setting, format, level) in [("gzip", "gzip", "1"), (ZSTD_ACKNOWLEDGED, "zstd", "3")] {
+            let env = env_of(&[
+                (PUSH_COMPRESSION_ENV, setting),
+                (PUSH_COMPRESSION_LEVEL_ENV, level),
+            ]);
+            let args = compression_args_from(&|k: &str| env.get(k).cloned()).unwrap();
+            assert_eq!(args[1], format);
+            assert_eq!(args[3], level, "explicit level must win for {format}");
+        }
     }
 
     #[test]
