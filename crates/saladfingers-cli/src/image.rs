@@ -38,9 +38,13 @@ pub const LOCKFILE_NAME: &str = "saladfingers-images.lock";
 /// Env var that overrides the configured registry base (`[registry] base`).
 const REGISTRY_REF_ENV: &str = "SALADFINGERS_REGISTRY_REF";
 /// Conventional env var holding the push username directly (not a name-of-var).
-const PUSH_USER_ENV: &str = "SALADFINGERS_REGISTRY_PUSH_USER";
-/// Conventional env var holding the push password/token directly.
-const PUSH_PASS_ENV: &str = "SALADFINGERS_REGISTRY_PUSH_PASS";
+///
+/// `pub(crate)` so `doctor` checks the same variable `image push` reads, rather
+/// than a second copy of the string that could drift from it.
+pub(crate) const PUSH_USER_ENV: &str = "SALADFINGERS_REGISTRY_PUSH_USER";
+/// Conventional env var holding the push password/token directly (see
+/// [`PUSH_USER_ENV`] for why this is `pub(crate)`).
+pub(crate) const PUSH_PASS_ENV: &str = "SALADFINGERS_REGISTRY_PUSH_PASS";
 /// Layer compression for the push: `gzip` (default), `none`, or — only via the
 /// long spelling in [`ZSTD_ACKNOWLEDGED`] — zstd. Anything else is rejected.
 ///
@@ -301,7 +305,7 @@ fn digest_ref(base: &str, name: &str, digest: &str) -> String {
 ///
 /// A missing value is a hard error (we never push anonymously).
 fn resolve_push_credentials(reg: Option<&RegistryConfig>) -> Result<(String, String)> {
-    let user = pick_credential(
+    let (user, user_src) = pick_credential(
         reg.and_then(|r| r.push_username_env.as_deref()),
         PUSH_USER_ENV,
         reg.and_then(|r| r.username_env.as_deref()),
@@ -311,7 +315,7 @@ fn resolve_push_credentials(reg: Option<&RegistryConfig>) -> Result<(String, Str
         "no registry push username — set SALADFINGERS_REGISTRY_PUSH_USER (or point \
          `[registry] push_username_env` / `username_env` at the env var holding it)",
     )?;
-    let pass = pick_credential(
+    let (pass, pass_src) = pick_credential(
         reg.and_then(|r| r.push_password_env.as_deref()),
         PUSH_PASS_ENV,
         reg.and_then(|r| r.password_env.as_deref()),
@@ -321,21 +325,69 @@ fn resolve_push_credentials(reg: Option<&RegistryConfig>) -> Result<(String, Str
         "no registry push password — set SALADFINGERS_REGISTRY_PUSH_PASS (or point \
          `[registry] push_password_env` / `password_env` at the env var holding it)",
     )?;
+    if let Some(warning) = pull_fallback_warning(user_src, pass_src) {
+        eprintln!("{warning}");
+    }
     Ok((user, pass))
+}
+
+/// Which step of the resolution chain produced a credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialSource {
+    /// The env var named by `[registry] push_username_env` / `push_password_env`.
+    NamedPush,
+    /// The conventional [`PUSH_USER_ENV`] / [`PUSH_PASS_ENV`].
+    Convention,
+    /// Last resort: the PULL credential. Legitimate when one token carries both
+    /// scopes, and a trap otherwise — see [`pull_fallback_warning`].
+    PullFallback,
 }
 
 /// Pure credential-picking used by [`resolve_push_credentials`]; `env` is the
 /// environment lookup (real env in production, a fake map in tests).
+///
+/// Returns the value together with the step that produced it, so the caller can
+/// tell a deliberate single-token setup from an unconfigured one.
 fn pick_credential(
     named_push: Option<&str>,
     convention_var: &str,
     named_pull: Option<&str>,
     env: &impl Fn(&str) -> Option<String>,
-) -> Option<String> {
+) -> Option<(String, CredentialSource)> {
     named_push
         .and_then(env)
-        .or_else(|| env(convention_var))
-        .or_else(|| named_pull.and_then(env))
+        .map(|v| (v, CredentialSource::NamedPush))
+        .or_else(|| env(convention_var).map(|v| (v, CredentialSource::Convention)))
+        .or_else(|| {
+            named_pull
+                .and_then(env)
+                .map(|v| (v, CredentialSource::PullFallback))
+        })
+}
+
+/// The warning to print when a push is about to authenticate with the PULL
+/// credential, or `None` when it is not.
+///
+/// The pull credential is the one handed to SaladCloud nodes at deploy time, so
+/// it is routinely read-only. When it is, this push has already failed — but it
+/// fails at the registry, several minutes and every blob later, as "requested
+/// access to the resource is denied" with no mention of credentials at all. A
+/// single token holding both scopes is a legitimate setup, so this stays a
+/// warning rather than an error; it just refuses to be silent.
+///
+/// Either half is enough: a real push username paired with the pull token as its
+/// password is denied exactly the same way.
+fn pull_fallback_warning(user_src: CredentialSource, pass_src: CredentialSource) -> Option<String> {
+    if user_src != CredentialSource::PullFallback && pass_src != CredentialSource::PullFallback {
+        return None;
+    }
+    Some(format!(
+        "image push: warning — no push credential configured, falling back to the PULL \
+         credential. That credential is the one handed to SaladCloud nodes for deploy-time \
+         pulls and is usually read-only, in which case login will succeed and the first layer \
+         upload will be denied. Set {PUSH_USER_ENV} / {PUSH_PASS_ENV}, or point \
+         `[registry] push_username_env` / `push_password_env` at the env vars holding them."
+    ))
 }
 
 // ---- external tools -------------------------------------------------------
@@ -804,20 +856,56 @@ mod tests {
                 Some("PULL_USER_VAR"),
                 &lookup
             ),
-            Some("push-user".to_string())
+            Some(("push-user".to_string(), CredentialSource::NamedPush))
         );
         // 2. convention var when no named push env.
         assert_eq!(
             pick_credential(None, PUSH_USER_ENV, Some("PULL_USER_VAR"), &lookup),
-            Some("convention-user".to_string())
+            Some(("convention-user".to_string(), CredentialSource::Convention))
         );
-        // 3. pull creds as last resort.
+        // 3. pull creds as last resort — reported as such, because that is the
+        //    case the operator needs to be told about.
         assert_eq!(
             pick_credential(Some("UNSET"), "UNSET_CONV", Some("PULL_USER_VAR"), &lookup),
-            Some("pull-user".to_string())
+            Some(("pull-user".to_string(), CredentialSource::PullFallback))
         );
         // Nothing configured → None.
         assert_eq!(pick_credential(None, "UNSET_CONV", None, &lookup), None);
+    }
+
+    /// The fallback is reported whenever it is taken and never otherwise — a
+    /// correctly configured push must not print a warning that costs an
+    /// operator time to rule out.
+    #[test]
+    fn pull_fallback_is_reported_for_either_half_only() {
+        use CredentialSource::{Convention, NamedPush, PullFallback};
+
+        for (user, pass) in [
+            (NamedPush, NamedPush),
+            (NamedPush, Convention),
+            (Convention, NamedPush),
+            (Convention, Convention),
+        ] {
+            assert_eq!(
+                pull_fallback_warning(user, pass),
+                None,
+                "{user:?}/{pass:?} is fully configured and must stay quiet"
+            );
+        }
+
+        // Either half falling back is enough: a real push username with the pull
+        // token as its password is denied exactly the same way.
+        for (user, pass) in [
+            (PullFallback, NamedPush),
+            (NamedPush, PullFallback),
+            (PullFallback, PullFallback),
+        ] {
+            let warning = pull_fallback_warning(user, pass)
+                .unwrap_or_else(|| panic!("{user:?}/{pass:?} must warn"));
+            // The warning has to name the fix, not just the problem.
+            assert!(warning.contains(PUSH_USER_ENV), "{warning}");
+            assert!(warning.contains(PUSH_PASS_ENV), "{warning}");
+        }
     }
 
     /// Build the env lookup the compression tests share.
