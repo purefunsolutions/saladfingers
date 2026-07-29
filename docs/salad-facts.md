@@ -109,3 +109,10 @@ and max **100000 ms = 100 s**), `country_codes`.
   image flavor).
 - Apple Metal is **not available** on SaladCloud — the fleet is PC nodes running
   linux/amd64 containers.
+- The `gpu-classes` list is **unordered and full of near-duplicate display names**
+  — `RTX 3060 (12 GB)` / `RTX 3060 (8 GB)` / `RTX 3060 Ti (8 GB)`, `RTX 3090` vs
+  `RTX 3090 Ti`, `RTX 5090` vs `RTX 5090 Laptop`. Names carry a trailing VRAM
+  parenthetical, and at least one (` RTX 5080 (16 GB)`) a leading space, so a name
+  identifies a class only in full; the UUID is the only exact handle. Anything
+  resolving a user-supplied class name must therefore refuse an ambiguous match
+  rather than take the first hit.

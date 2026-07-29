@@ -11,6 +11,32 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+/// Default GPU class for `gpu-probe` and `doctor --live`.
+///
+/// Spelled in full because the live list carries two RTX 3060 variants whose base
+/// names collide, so the bare `"rtx3060"` this replaced is ambiguous. The 8 GB one
+/// because these two commands only need *a* node to answer a question about the
+/// fleet — never VRAM — and it is the cheaper of the pair: $0.03/h at batch
+/// against $0.04/h for the 12 GB.
+pub const DEFAULT_PROBE_GPU_CLASS: &str = "RTX 3060 (8 GB)";
+
+/// Long help shared by every `--gpu-class` argument, so the resolution rules are
+/// stated once rather than repeated across the six commands that take one.
+///
+/// Attached as `long_help` rather than `help`: each site keeps its own short doc
+/// comment for `-h`, and this appears under `--help`.
+const GPU_CLASS_HELP: &str = "\
+GPU class name or UUID.
+
+Matched ignoring case, spaces and punctuation, in decreasing order of confidence:
+exact UUID; exact name (\"RTX 4090 (24 GB)\"); exact name without the VRAM suffix
+(\"rtx 3090\" resolves to RTX 3090 (24 GB), not the Ti); then a substring, if it
+matches exactly one class.
+
+A query matching several classes is an error listing them, so the live list's
+near-duplicates (\"RTX 3060 (8 GB)\" vs \"(12 GB)\") are never decided by API list
+order. Run `saladfingers gpu-classes` for the full list.";
+
 /// Rent SaladCloud GPUs for minimum billed seconds.
 #[derive(Debug, Parser)]
 #[command(name = "saladfingers", version, about, long_about = None)]
@@ -132,7 +158,7 @@ pub enum CostCommand {
 #[derive(Debug, Args)]
 pub struct CostEstimateArgs {
     /// GPU class name or UUID.
-    #[arg(long)]
+    #[arg(long, long_help = GPU_CLASS_HELP)]
     pub gpu_class: String,
     /// Priority tier.
     #[arg(long, default_value = "batch")]
@@ -157,7 +183,7 @@ pub struct RunArgs {
     #[arg(long)]
     pub image: Option<String>,
     /// GPU class name or UUID (repeatable = first-available).
-    #[arg(long = "gpu-class")]
+    #[arg(long = "gpu-class", long_help = GPU_CLASS_HELP)]
     pub gpu_classes: Vec<String>,
     /// Number of shards (each a single-replica group). Given explicitly, it overrides
     /// the profile in BOTH directions — a profile's 8 with `--replicas 2` runs 2, not 8.
@@ -267,7 +293,7 @@ pub struct SessionCreateArgs {
     #[arg(long)]
     pub image: Option<String>,
     /// GPU class name or UUID (repeatable; overrides the profile).
-    #[arg(long = "gpu-class")]
+    #[arg(long = "gpu-class", long_help = GPU_CLASS_HELP)]
     pub gpu_classes: Vec<String>,
     /// Priority tier (`high|medium|low|batch`; overrides the profile).
     #[arg(long)]
@@ -343,7 +369,7 @@ pub struct ServeUpArgs {
     #[arg(long)]
     pub image: Option<String>,
     /// GPU class name or UUID (repeatable; overrides the profile).
-    #[arg(long = "gpu-class")]
+    #[arg(long = "gpu-class", long_help = GPU_CLASS_HELP)]
     pub gpu_classes: Vec<String>,
     /// Priority tier (`high|medium|low|batch`; overrides the profile).
     #[arg(long)]
@@ -381,7 +407,7 @@ pub enum BenchCommand {
 #[derive(Debug, Args)]
 pub struct BenchStartupArgs {
     /// GPU class name or UUID.
-    #[arg(long)]
+    #[arg(long, long_help = GPU_CLASS_HELP)]
     pub gpu_class: String,
     /// Image reference.
     #[arg(long)]
@@ -416,7 +442,7 @@ pub struct ImagePushArgs {
 #[derive(Debug, Args)]
 pub struct GpuProbeArgs {
     /// GPU class name or UUID to probe on.
-    #[arg(long, default_value = "rtx3060")]
+    #[arg(long, default_value = DEFAULT_PROBE_GPU_CLASS, long_help = GPU_CLASS_HELP)]
     pub gpu_class: String,
     /// Probe image ref (else `SALADFINGERS_PROBE_IMAGE`).
     #[arg(long)]

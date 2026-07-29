@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use saladfingers_api::{
     BasicAuth, ContainerPriority, CreateContainer, CreateContainerGroup, GroupStatus, Instance,
@@ -35,7 +35,7 @@ pub async fn resolve_gpu_uuids(
     let mut uuids = Vec::with_capacity(classes.len());
     for name in classes {
         let class = commands::resolve_gpu_class(&available, name)
-            .with_context(|| format!("no GPU class matching '{name}'"))?;
+            .map_err(|e| anyhow::anyhow!("GPU class '{name}': {e}"))?;
         uuids.push(class.id.clone());
     }
     Ok(uuids)
@@ -52,7 +52,7 @@ pub async fn gpu_hourly_price(
     let available = state::cached_gpu_classes(client, false, CACHE_TTL_HOURS)
         .await
         .ok()?;
-    let class = commands::resolve_gpu_class(&available, class_name)?;
+    let class = commands::resolve_gpu_class(&available, class_name).ok()?;
     class.price(priority)
 }
 

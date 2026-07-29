@@ -109,7 +109,7 @@ pub async fn doctor(cfg: Config, args: DoctorArgs) -> Result<()> {
 
 async fn live_probe(cfg: &Config) -> anyhow::Result<saladfingers_protocol::ProbeReport> {
     let image = crate::probecmd::probe_image(None)?;
-    crate::probecmd::run_probe(cfg, "rtx3060", &image, "batch").await
+    crate::probecmd::run_probe(cfg, crate::cli::DEFAULT_PROBE_GPU_CLASS, &image, "batch").await
 }
 
 fn validate_profiles(cfg: &Config, checks: &mut Vec<Check>) {
