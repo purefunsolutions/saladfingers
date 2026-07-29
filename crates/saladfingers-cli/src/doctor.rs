@@ -7,7 +7,8 @@
 use anyhow::{Result, bail};
 
 use crate::cli::DoctorArgs;
-use crate::config::Config;
+use crate::config::{Config, RegistryConfig};
+use crate::image::{PUSH_PASS_ENV, PUSH_USER_ENV};
 use crate::output::{OutputFormat, print_json, print_table, table};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -199,6 +200,41 @@ fn validate_registry(cfg: &Config, checks: &mut Vec<Check>) {
         checks.push(Check::warn(
             "registry",
             format!("credentials not in environment: {}", missing.join(", ")),
+        ));
+    }
+    validate_registry_push(registry, checks);
+}
+
+/// Report push-credential resolution separately from the pull pair.
+///
+/// The two are different roles: the pull credential is handed to SaladCloud nodes
+/// so they can fetch the image at deploy time, and is routinely read-only; the
+/// push credential is the operator's. `image push` falls back from the second to
+/// the first, so a machine holding only pull credentials looked perfectly
+/// configured here and then failed at the first layer upload — the check said
+/// "registry OK" because, for the role it was checking, it was.
+fn validate_registry_push(registry: &RegistryConfig, checks: &mut Vec<Check>) {
+    let resolved = |named: Option<&str>, convention: &str| -> bool {
+        let set = |var: &str| {
+            std::env::var(var)
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false)
+        };
+        named.is_some_and(set) || set(convention)
+    };
+    let user = resolved(registry.push_username_env.as_deref(), PUSH_USER_ENV);
+    let pass = resolved(registry.push_password_env.as_deref(), PUSH_PASS_ENV);
+    if user && pass {
+        checks.push(Check::ok("registry push", "push credentials resolved"));
+    } else {
+        checks.push(Check::warn(
+            "registry push",
+            format!(
+                "no push credentials — `image push` will fall back to the read-only pull \
+                 credential and fail at the first layer upload. Set {PUSH_USER_ENV} / \
+                 {PUSH_PASS_ENV}, or point `[registry] push_username_env` / \
+                 `push_password_env` at the env vars holding them"
+            ),
         ));
     }
 }

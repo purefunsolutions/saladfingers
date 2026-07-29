@@ -100,15 +100,36 @@ and max **100000 ms = 100 s**), `country_codes`.
 
 - Images are **linux/amd64 only**, **max 35 GB compressed**. Pulled once into
   Salad's internal EU/US cache, then fanned out to nodes.
+
+- **Layers must be gzip — nodes cannot unpack zstd.** Measured 2026-07-29 with one
+  58.7 MiB image (`gpu-probe`) pushed both ways and deployed to `RTX 3060 (8 GB)` at
+  batch, compression the only variable: the `tar+gzip` copy reached `running` in
+  **2 min 17 s** on its first instance, while `tar+zstd` **never** did in 1200 s,
+  burning 10+ instances across 2 machines on repeated
+  `Instance Start Failure: Other`. It **downloads fine** (`Instance Downloading`
+  fires, instances reach `creating`), so this is the runtime failing to unpack
+  rather than a pull or registry-auth problem; the platform retries on one machine,
+  reallocates, repeats. The event name is literally `Other` — nothing anywhere names
+  compression, so it is indistinguishable from a bad node. Push
+  `application/vnd.oci.image.layer.v1.tar+gzip` and do not spend a day on it. The
+  failed run cost **$0** (only `running` bills), so this is cheap to re-check if
+  Salad's runtime is upgraded. `image push` *refuses*
+  `SALADFINGERS_PUSH_COMPRESSION=zstd` outright — [`registry.md`](registry.md) has
+  the acknowledged spelling that overrides it, and the gate should go once zstd
+  stops reproducing this.
+
 - NVIDIA: the host injects the driver (`nvidia-smi` works; exact injected library
   paths are undocumented — see [`empirical.md`](empirical.md)). Containers bring
   their own CUDA userspace (cudart/cublas/nvrtc/cudnn). RTX 50-series (`sm_120`)
   needs CUDA ≥ 12.8.
+
 - AMD classes exist (ROCm/HIP; `/dev/kfd` + `/dev/dri`, `rocminfo`/`amd-smi`).
   saladfingers ships hello-world ROCm support (vendor-aware probe, `rocm-runtime`
   image flavor).
+
 - Apple Metal is **not available** on SaladCloud — the fleet is PC nodes running
   linux/amd64 containers.
+
 - The `gpu-classes` list is **unordered and full of near-duplicate display names**
   — `RTX 3060 (12 GB)` / `RTX 3060 (8 GB)` / `RTX 3060 Ti (8 GB)`, `RTX 3090` vs
   `RTX 3090 Ti`, `RTX 5090` vs `RTX 5090 Laptop`. Names carry a trailing VRAM
