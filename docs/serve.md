@@ -13,7 +13,7 @@ self-stop when idle so a forgotten box never bills indefinitely.
 ## `session` — an interactive GPU dev box
 
 ```sh
-saladfingers session create --image REF --gpu-class rtx3060 \
+saladfingers session create --image REF --gpu-class "RTX 3060 (8 GB)" \
   --deadman 15m --max-duration 4h --name dev
 saladfingers session exec dev -- nvidia-smi
 saladfingers session cp ./data.bin dev:/work/data.bin     # upload

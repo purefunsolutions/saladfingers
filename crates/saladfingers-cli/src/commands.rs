@@ -78,7 +78,7 @@ pub async fn cost_estimate(cfg: Config, args: CostEstimateArgs) -> Result<()> {
     let client = cfg.client()?;
     let classes = state::cached_gpu_classes(&client, false, GPU_CACHE_TTL_HOURS).await?;
     let class = resolve_gpu_class(&classes, &args.gpu_class)
-        .with_context(|| format!("no GPU class matching '{}'", args.gpu_class))?;
+        .map_err(|e| anyhow::anyhow!("GPU class '{}': {e}", args.gpu_class))?;
     let hourly = class.price(priority).with_context(|| {
         format!(
             "class '{}' has no {} price",
@@ -139,19 +139,99 @@ fn normalize(s: &str) -> String {
         .collect()
 }
 
-/// Resolve a GPU class by exact UUID, exact normalized name, or normalized substring.
-pub(crate) fn resolve_gpu_class<'a>(classes: &'a [GpuClass], query: &str) -> Option<&'a GpuClass> {
-    if let Some(exact) = classes.iter().find(|c| c.id == query) {
-        return Some(exact);
+/// The class name with its trailing VRAM parenthetical removed, normalized:
+/// `"RTX 3060 Ti (8 GB)"` → `"rtx3060ti"`.
+///
+/// Live names always carry that suffix, so without stripping it a natural query
+/// like `"rtx 3060 ti"` can never match exactly and falls through to substring
+/// matching — see [`resolve_gpu_class`].
+fn normalize_base(name: &str) -> String {
+    normalize(name.split('(').next().unwrap_or(name))
+}
+
+/// Why a GPU-class query did not resolve to exactly one class.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GpuClassError {
+    /// Nothing matched, at any tier.
+    NotFound,
+    /// Several classes matched at the same tier. Carries their display names so
+    /// the operator can copy one verbatim.
+    Ambiguous(Vec<String>),
+}
+
+impl std::fmt::Display for GpuClassError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "no matching GPU class"),
+            Self::Ambiguous(names) => write!(
+                f,
+                "matches {} classes ({}) — pass the exact name or its UUID",
+                names.len(),
+                names.join(", ")
+            ),
+        }
     }
+}
+
+/// Which rule matched a class, in decreasing order of confidence.
+#[derive(Debug, Clone, Copy)]
+enum Tier {
+    /// The UUID, verbatim.
+    Uuid,
+    /// The full name, normalized: `"RTX 3060 Ti (8 GB)"`.
+    ExactName,
+    /// The name without its VRAM parenthetical: `"rtx 3060 ti"`.
+    BaseName,
+    /// A substring of the normalized name: `"5080"`, `"a5000"`.
+    Substring,
+}
+
+/// Resolve a GPU class, trying each [`Tier`] in turn.
+///
+/// **The first tier that matches anything decides**, so a broad tier can never
+/// override a precise one, and a tier that matches several classes is an error
+/// rather than a pick.
+///
+/// That rule is the fix for a real footgun: the live class list is unordered, so
+/// a bare substring search made `"rtx 3060"` resolve to whichever of
+/// `RTX 3060 (12 GB)` / `RTX 3060 (8 GB)` / `RTX 3060 Ti (8 GB)` the API happened
+/// to list first — silently renting a different card, at a different price and a
+/// different SM arch. Now `"rtx 3060 ti"` is an exact base name, `"rtx 3090"`
+/// resolves to the non-Ti, and a genuinely ambiguous query names its candidates
+/// instead of flipping a coin.
+///
+/// # Errors
+/// [`GpuClassError::NotFound`] if no tier matched, [`GpuClassError::Ambiguous`]
+/// if the first tier that matched hit more than one class.
+pub(crate) fn resolve_gpu_class<'a>(
+    classes: &'a [GpuClass],
+    query: &str,
+) -> Result<&'a GpuClass, GpuClassError> {
     let nq = normalize(query);
     if nq.is_empty() {
-        return None;
+        return Err(GpuClassError::NotFound);
     }
-    classes
-        .iter()
-        .find(|c| normalize(&c.name) == nq)
-        .or_else(|| classes.iter().find(|c| normalize(&c.name).contains(&nq)))
+    for tier in [Tier::Uuid, Tier::ExactName, Tier::BaseName, Tier::Substring] {
+        let hits: Vec<&GpuClass> = classes
+            .iter()
+            .filter(|&c| match tier {
+                Tier::Uuid => c.id == query,
+                Tier::ExactName => normalize(&c.name) == nq,
+                Tier::BaseName => normalize_base(&c.name) == nq,
+                Tier::Substring => normalize(&c.name).contains(&nq),
+            })
+            .collect();
+        match hits.as_slice() {
+            [] => {}
+            [one] => return Ok(one),
+            many => {
+                return Err(GpuClassError::Ambiguous(
+                    many.iter().map(|c| c.name.trim().to_string()).collect(),
+                ));
+            }
+        }
+    }
+    Err(GpuClassError::NotFound)
 }
 
 #[cfg(test)]
@@ -168,26 +248,124 @@ mod tests {
         }
     }
 
+    /// The real ambiguous names from the live class list, in an order that would
+    /// make a first-substring-wins search pick the WRONG card for `"rtx 3060"`
+    /// (the Ti is listed first).
+    fn live_classes() -> Vec<GpuClass> {
+        vec![
+            class("uuid-3060ti", "RTX 3060 Ti (8 GB)"),
+            class("uuid-3060-8", "RTX 3060 (8 GB)"),
+            class("uuid-3060-12", "RTX 3060 (12 GB)"),
+            class("uuid-3090", "RTX 3090 (24 GB)"),
+            class("uuid-3090ti", "RTX 3090 Ti (24 GB)"),
+            class("uuid-4090", "RTX 4090 (24 GB)"),
+            class("uuid-5090-lap", "RTX 5090 Laptop (24 GB)"),
+            class("uuid-5090", "RTX 5090 (32 GB)"),
+            class("uuid-5080", " RTX 5080 (16 GB)"), // note the leading space from the live API
+        ]
+    }
+
     #[test]
     fn resolve_matches_uuid_name_and_substring() {
-        let classes = vec![
-            class("uuid-3060", "RTX 3060 (12 GB)"),
-            class("uuid-4090", "RTX 4090 (24 GB)"),
-            class("uuid-5080", " RTX 5080 (16 GB)"), // note the leading space from the live API
-        ];
+        let classes = live_classes();
         assert_eq!(
             resolve_gpu_class(&classes, "uuid-4090").unwrap().id,
             "uuid-4090"
         );
         assert_eq!(
             resolve_gpu_class(&classes, "RTX 3060 (12 GB)").unwrap().id,
-            "uuid-3060"
+            "uuid-3060-12"
         );
         assert_eq!(
             resolve_gpu_class(&classes, "rtx4090").unwrap().id,
             "uuid-4090"
         );
         assert_eq!(resolve_gpu_class(&classes, "5080").unwrap().id, "uuid-5080");
-        assert!(resolve_gpu_class(&classes, "h100").is_none());
+        assert_eq!(
+            resolve_gpu_class(&classes, "h100").unwrap_err(),
+            GpuClassError::NotFound
+        );
+    }
+
+    /// The bug this tier exists for: a base-name query must never be decided by
+    /// API list order.
+    #[test]
+    fn resolve_prefers_exact_base_name_over_substring() {
+        let classes = live_classes();
+        // "rtx 3060 ti" is a unique base name → the Ti, even though it is also a
+        // substring-superset case.
+        assert_eq!(
+            resolve_gpu_class(&classes, "rtx 3060 ti").unwrap().id,
+            "uuid-3060ti"
+        );
+        assert_eq!(
+            resolve_gpu_class(&classes, "RTX 3090 Ti").unwrap().id,
+            "uuid-3090ti"
+        );
+        // Unique base names that a substring search would have made ambiguous
+        // against their Ti / Laptop siblings.
+        assert_eq!(
+            resolve_gpu_class(&classes, "rtx 3090").unwrap().id,
+            "uuid-3090"
+        );
+        assert_eq!(
+            resolve_gpu_class(&classes, "rtx 5090").unwrap().id,
+            "uuid-5090"
+        );
+        assert_eq!(
+            resolve_gpu_class(&classes, "rtx 5090 laptop").unwrap().id,
+            "uuid-5090-lap"
+        );
+    }
+
+    /// Genuinely ambiguous queries must fail loudly, naming the candidates —
+    /// never silently rent one of them.
+    #[test]
+    fn resolve_reports_ambiguity() {
+        let classes = live_classes();
+        // Two VRAM variants share the base name "RTX 3060".
+        match resolve_gpu_class(&classes, "rtx 3060") {
+            Err(GpuClassError::Ambiguous(names)) => {
+                assert_eq!(names.len(), 2, "got {names:?}");
+                assert!(names.iter().any(|n| n.contains("8 GB")));
+                assert!(names.iter().any(|n| n.contains("12 GB")));
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+        // A broad substring matches many classes.
+        match resolve_gpu_class(&classes, "rtx") {
+            Err(GpuClassError::Ambiguous(names)) => assert!(names.len() > 5, "got {names:?}"),
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+        // Disambiguating by full name still works.
+        assert_eq!(
+            resolve_gpu_class(&classes, "RTX 3060 (8 GB)").unwrap().id,
+            "uuid-3060-8"
+        );
+    }
+
+    /// `gpu-probe` and `doctor --live` both default to this class, so it must
+    /// resolve on its own. It used to be the bare `"rtx3060"`, which is the one
+    /// genuinely ambiguous base name in the live list — this fails the moment a
+    /// default is pointed at an ambiguous name again.
+    #[test]
+    fn the_probe_default_resolves_unambiguously() {
+        let classes = live_classes();
+        let class = resolve_gpu_class(&classes, crate::cli::DEFAULT_PROBE_GPU_CLASS)
+            .expect("the probe default must resolve");
+        assert_eq!(class.id, "uuid-3060-8");
+    }
+
+    /// Every tier is uniqueness-checked, including the exact-name one. Two live
+    /// names that differ only in spacing normalize identically; taking the first
+    /// would be the same coin flip this module exists to remove.
+    #[test]
+    fn duplicate_normalized_names_are_ambiguous_not_first_wins() {
+        let mut classes = live_classes();
+        classes.push(class("uuid-4090-dup", "RTX 4090 (24GB)"));
+        match resolve_gpu_class(&classes, "RTX 4090 (24 GB)") {
+            Err(GpuClassError::Ambiguous(names)) => assert_eq!(names.len(), 2, "got {names:?}"),
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
     }
 }
