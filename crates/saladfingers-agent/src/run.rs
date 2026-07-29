@@ -513,10 +513,55 @@ async fn upload_outputs(http: &reqwest::Client, spec: &JobSpec) -> Result<Vec<Up
 }
 
 /// Resolve an output's `src_glob` against the job workdir into de-duplicated paths (relative
-/// to `workdir`). A `**`-style pattern matches a directory and all its contents, so entries
-/// nested under an earlier match are dropped to archive each path exactly once. An empty
-/// result is a real failure the caller must surface, never a silent skip.
+/// to `workdir`). A trailing `**` resolves to the matching directories themselves, which the
+/// tar walk then takes recursively; entries nested under an earlier match are dropped so each
+/// path is archived exactly once. An empty result is a real failure the caller must surface,
+/// never a silent skip.
 fn glob_outputs(workdir: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
+    // A TRAILING `**` does not mean what everyone writing it assumes. The `glob`
+    // crate resolves `dir/**` to the directories BELOW `dir` — never `dir` itself,
+    // and never the files sitting at `dir`'s own root.
+    //
+    // That cost a real checkpoint. A 10k-step run with `--output "ckpt/**:ckpt"`
+    // shipped `step_00008000/` and `step_00010000/` and silently left behind
+    // `ckpt/LATEST.json` — the marker tooling reads to find the newest
+    // checkpoint. Every layer reported success.
+    //
+    // So a trailing `**` resolves to the matching DIRECTORIES themselves and the
+    // tar walk recurses from each: what was meant, and strictly more complete.
+    // The rule is applied by rewriting the pattern to its base and globbing THAT,
+    // rather than by testing a base path on the filesystem — which is what makes
+    // it hold for a wildcard base as well. `*/**` and `a*/**` have exactly the
+    // same defect, and `workdir.join("a*").is_dir()` can never be true.
+    //
+    // An EMPTY matching directory is taken like any other, because every other way
+    // of naming the same directory already does: `ckpt` and `ckpt/` both resolve to
+    // it and upload an empty archive, and `*` lists it alongside its siblings. A
+    // guard here would make `ckpt/**` the one spelling that calls an empty `ckpt` an
+    // error, and it could not even mean "holds data" — a directory whose only
+    // content is another empty directory has a dirent and would pass. The caller's
+    // "pattern matched no files" bail still covers what it was written for, a
+    // pattern naming nothing at all: a missing path, or a typo.
+    let trimmed = pattern.trim_end_matches('/');
+    // A bare `**` is the same pattern rooted at the workdir. No glob expresses
+    // that as a relative match, so it is spelled out: the empty path.
+    if trimmed == "**" {
+        return Ok(vec![PathBuf::new()]);
+    }
+    if let Some(base) = trimmed.strip_suffix("/**") {
+        // Directories only: a trailing `/**` asks for a tree, so a plain file that
+        // happens to match the base is not one, and says so by matching nothing.
+        return Ok(glob_paths(workdir, base)?
+            .into_iter()
+            .filter(|p| workdir.join(p).is_dir())
+            .collect());
+    }
+    glob_paths(workdir, pattern)
+}
+
+/// Glob `pattern` under `workdir`, drop entries nested under an earlier match so each
+/// path is archived exactly once, and relativize the result against `workdir`.
+fn glob_paths(workdir: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
     let joined = workdir.join(pattern);
     let joined = joined
         .to_str()
@@ -752,6 +797,134 @@ mod tests {
         // download threshold with no inputs). An absent reading must NOT count as
         // below-threshold, so it can never trigger a reallocation.
         assert!(!below_threshold(Some(100.0), None));
+    }
+
+    /// `dir/**` must ship the FILES at `dir`'s root, not only its subdirs.
+    ///
+    /// Found by a real 10k-step training run: `--output "ckpt/**:ckpt"`
+    /// delivered `step_00008000/` and `step_00010000/` and silently left behind
+    /// `ckpt/LATEST.json` — the marker tooling reads to find the newest
+    /// checkpoint without listing and sorting directories. Every layer reported
+    /// success, so the loss is invisible until something looks for the file.
+    #[test]
+    fn a_recursive_glob_includes_files_at_the_directory_root() {
+        let work = tempfile::tempdir().unwrap();
+        let w = work.path();
+        std::fs::create_dir_all(w.join("ckpt").join("step_00010000")).unwrap();
+        std::fs::write(w.join("ckpt").join("LATEST.json"), b"{}").unwrap();
+        std::fs::write(
+            w.join("ckpt")
+                .join("step_00010000")
+                .join("model.safetensors"),
+            b"m",
+        )
+        .unwrap();
+
+        // Exactly one match, and it is the directory: `upload_outputs` then takes
+        // the single-path route, where the directory flattens to the archive root.
+        // A fan-out over the subdirectories both drops the marker (the bug) and
+        // doubles the path component on extraction, so the count matters as much
+        // as the coverage. Unfixed, this returns ["ckpt/step_00010000"].
+        assert_eq!(
+            glob_outputs(w, "ckpt/**").unwrap(),
+            vec![PathBuf::from("ckpt")]
+        );
+    }
+
+    /// A bare `**` is `dir/**` rooted at the workdir, and drops root-level files
+    /// the same way if it is not given the same treatment. `--output "**:all"` is
+    /// how one naturally spells "everything", so it must not be the one spelling
+    /// that silently loses files.
+    #[test]
+    fn a_bare_recursive_glob_covers_the_whole_workdir() {
+        let work = tempfile::tempdir().unwrap();
+        let w = work.path();
+        std::fs::create_dir_all(w.join("sub")).unwrap();
+        std::fs::write(w.join("sub").join("a.pt"), b"a").unwrap();
+        std::fs::write(w.join("root.json"), b"{}").unwrap();
+
+        // The workdir itself, as the empty relative path. Unfixed this is ["sub"],
+        // and root.json never ships.
+        let m = glob_outputs(w, "**").unwrap();
+        assert_eq!(m, vec![PathBuf::from("")]);
+        // What `upload_outputs` then does with it must still be a directory to
+        // archive — `workdir.join("")` is the workdir.
+        assert!(w.join(&m[0]).is_dir());
+
+        // A trailing slash is the same pattern.
+        assert_eq!(glob_outputs(w, "**/").unwrap(), vec![PathBuf::from("")]);
+        // Matching `**` by equality rather than by stripping it cannot capture a
+        // pattern like `s**` — and nothing is lost by that, because the glob crate
+        // rejects one outright: "recursive wildcards must form a single path
+        // component". So the two spellings above are the whole of `**`.
+        assert!(glob_outputs(w, "s**").is_err());
+    }
+
+    /// Every spelling of the same directory must agree about it, empty or not, and
+    /// only a pattern naming NOTHING may reach the caller's "matched no files" bail.
+    ///
+    /// The trap here is a guard that drops empty directories: it reads as prudence
+    /// (a job that produced nothing must not report success, since the CLI deletes
+    /// the group on success) but it makes `ckpt/**` the single spelling that calls
+    /// an empty `ckpt` an error while `ckpt`, `ckpt/` and `*` all take it happily.
+    /// It cannot even mean "holds data" — `hollow` below has a dirent and no bytes.
+    #[test]
+    fn a_recursive_glob_agrees_with_every_other_spelling_about_empty_dirs() {
+        let work = tempfile::tempdir().unwrap();
+        let w = work.path();
+        std::fs::create_dir_all(w.join("empty")).unwrap();
+        std::fs::create_dir_all(w.join("hollow").join("inner")).unwrap();
+        std::fs::create_dir_all(w.join("full")).unwrap();
+        std::fs::write(w.join("full").join("f.bin"), b"f").unwrap();
+        std::fs::write(w.join("afile"), b"f").unwrap();
+
+        let one = |p| vec![PathBuf::from(p)];
+        // An empty directory: the same answer however it is named.
+        assert_eq!(glob_outputs(w, "empty").unwrap(), one("empty"));
+        assert_eq!(glob_outputs(w, "empty/").unwrap(), one("empty"));
+        assert_eq!(glob_outputs(w, "empty/**").unwrap(), one("empty"));
+        // ...including as one of several matches.
+        let mut all = glob_outputs(w, "*/**").unwrap();
+        all.sort();
+        assert_eq!(
+            all,
+            vec![
+                PathBuf::from("empty"),
+                PathBuf::from("full"),
+                PathBuf::from("hollow"),
+            ],
+            "`*/**` must list the same directories `*` does"
+        );
+        // Only a directory, though: a trailing `/**` asks for a tree.
+        assert!(glob_outputs(w, "afile/**").unwrap().is_empty());
+        // And a pattern naming nothing still reaches the caller's bail.
+        assert!(glob_outputs(w, "missing/**").unwrap().is_empty());
+        assert!(glob_outputs(w, "missing").unwrap().is_empty());
+    }
+
+    /// A trailing `**` on a WILDCARD base has the identical defect, and a fix that
+    /// tests the base on the filesystem cannot reach it: `workdir.join("a*")` is
+    /// never a directory. Unfixed, `*/**` returned only the grandchild directories —
+    /// dropping whole top-level matches, not merely the files beside them.
+    #[test]
+    fn a_recursive_glob_works_on_a_wildcard_base() {
+        let work = tempfile::tempdir().unwrap();
+        let w = work.path();
+        std::fs::create_dir_all(w.join("adir")).unwrap();
+        std::fs::write(w.join("adir").join("x.txt"), b"x").unwrap();
+        std::fs::create_dir_all(w.join("ckpt").join("step_1")).unwrap();
+        std::fs::write(w.join("ckpt").join("LATEST.json"), b"{}").unwrap();
+
+        // Unfixed: ["ckpt/step_1"] — `adir` gone entirely, `LATEST.json` with it.
+        let mut m = glob_outputs(w, "*/**").unwrap();
+        m.sort();
+        assert_eq!(m, vec![PathBuf::from("adir"), PathBuf::from("ckpt")]);
+
+        // Unfixed: [] — a loud failure, but still the wrong answer.
+        assert_eq!(
+            glob_outputs(w, "a*/**").unwrap(),
+            vec![PathBuf::from("adir")]
+        );
     }
 
     #[test]
