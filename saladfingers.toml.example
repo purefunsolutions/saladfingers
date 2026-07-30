@@ -48,6 +48,19 @@ password_env = "SALADFINGERS_REGISTRY_PASSWORD"
 # push_username_env = "SALADFINGERS_REGISTRY_PUSH_USER"
 # push_password_env = "SALADFINGERS_REGISTRY_PUSH_PASS"
 
+# How `image push` builds images. Both settings are about the BUILD host — the images
+# themselves are always linux/amd64. Everything here has a sensible default; see
+# docs/macos.md.
+# [build]
+# Build and push over SSH instead of locally, so the multi-GB image closure is
+# substituted straight onto that machine and never crosses this one's link. Use it when
+# the remote has the faster uplink. `--on <ssh-host>` overrides.
+# host = "user@builder.example.com"
+# Flake system whose `<name>-image` attribute is built. Defaults to this machine's own
+# system on macOS (assembling the linux/amd64 image natively — no Linux builder needed)
+# and x86_64-linux elsewhere. `--system` / SALADFINGERS_IMAGE_SYSTEM override.
+# image_system = "x86_64-linux"
+
 # ---------------------------------------------------------------------------
 # Profiles: named run configurations. Reference with `--profile <name>`.
 # ---------------------------------------------------------------------------

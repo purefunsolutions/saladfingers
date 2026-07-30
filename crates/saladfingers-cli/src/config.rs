@@ -30,6 +30,8 @@ pub struct Config {
     pub storage: Option<StorageConfig>,
     /// Container registry, if configured.
     pub registry: Option<RegistryConfig>,
+    /// How `image push` builds images.
+    pub build: BuildConfig,
     /// Global defaults.
     pub defaults: Defaults,
     /// Named run profiles.
@@ -105,6 +107,24 @@ pub struct RegistryConfig {
     /// falls back to `SALADFINGERS_REGISTRY_PUSH_PASS` then to `password_env`.
     #[serde(default)]
     pub push_password_env: Option<String>,
+}
+
+/// How and where `image push` builds images (the `[build]` section).
+///
+/// Both fields are about the *build* host, never about what runs on SaladCloud: images
+/// are always linux/amd64. See `docs/macos.md`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BuildConfig {
+    /// SSH destination that builds and pushes, instead of this machine (`--on`).
+    /// The whole build+push happens there, so the image closure never crosses this
+    /// machine's link — useful when the remote has the faster uplink.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Flake system whose `<name>-image` attribute is built. Defaults to the host's own
+    /// system on macOS (assembling a linux/amd64 image natively) and `x86_64-linux`
+    /// everywhere else; `--system` and `SALADFINGERS_IMAGE_SYSTEM` override it.
+    #[serde(default)]
+    pub image_system: Option<String>,
 }
 
 /// A named run profile.
@@ -198,6 +218,8 @@ struct FileConfig {
     #[serde(default)]
     registry: Option<RegistryConfig>,
     #[serde(default)]
+    build: Option<BuildConfig>,
+    #[serde(default)]
     profiles: BTreeMap<String, Profile>,
 }
 
@@ -247,6 +269,7 @@ impl Config {
             api_key,
             storage: merged.storage,
             registry: merged.registry,
+            build: merged.build.unwrap_or_default(),
             defaults: Defaults {
                 priority: salad.priority,
                 country_codes: salad.country_codes,
@@ -290,6 +313,7 @@ fn merge(base: FileConfig, over: FileConfig) -> FileConfig {
         salad: merge_salad(base.salad, over.salad),
         storage: over.storage.or(base.storage),
         registry: over.registry.or(base.registry),
+        build: over.build.or(base.build),
         profiles,
     }
 }
