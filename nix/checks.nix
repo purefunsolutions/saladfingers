@@ -35,6 +35,18 @@
           # tests that only ever speak plain HTTP to a local wiremock. The
           # production images bake this same bundle (see image-lib.nix).
           SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+          # Boot ephemeral local Garage in the `presign_round_trip` test so the
+          # previously-#[ignore]'d S3 presign round-trip actually runs in CI. The
+          # binary is on PATH via nativeBuildInputs and pinned through this env
+          # var. Linux-only: garage isn't guaranteed to build on the flake's darwin
+          # systems and darwin CI is disabled; the test self-skips elsewhere.
+          nativeBuildInputs =
+            (commonArgs.nativeBuildInputs or [])
+            ++ (pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.garage]);
+          SALADFINGERS_GARAGE_BIN =
+            pkgs.lib.optionalString
+            pkgs.stdenv.hostPlatform.isLinux
+            "${pkgs.garage}/bin/garage";
         });
 
       saladfingers-doc = craneLib.cargoDoc (commonArgs

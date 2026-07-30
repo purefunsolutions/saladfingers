@@ -152,6 +152,9 @@ fn env_var(name: Option<&str>, field: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Stdio;
+    use tempfile::TempDir;
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn presigned_urls_are_well_formed() {
@@ -173,28 +176,10 @@ mod tests {
         assert!(put.contains("X-Amz-Signature"), "{put}");
     }
 
-    /// Live smoke: presign a PUT + GET against a real S3-compatible endpoint and
-    /// round-trip a small object with no credentials on the wire (the SaladCloud
-    /// data path). Endpoint/bucket/region and creds all come from the environment,
-    /// so no deployment details live in the repo. Gated on `SALADFINGERS_S3_ENDPOINT`.
-    #[tokio::test]
-    #[ignore = "live storage round-trip; set SALADFINGERS_S3_* and run --ignored"]
-    async fn presign_round_trip_live() {
-        let Ok(endpoint) = std::env::var("SALADFINGERS_S3_ENDPOINT") else {
-            eprintln!("skipping: SALADFINGERS_S3_ENDPOINT unset");
-            return;
-        };
-        let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} must be set"));
-        let backend = S3Backend::new(
-            &endpoint,
-            &std::env::var("SALADFINGERS_S3_REGION").unwrap_or_else(|_| "auto".into()),
-            &var("SALADFINGERS_S3_BUCKET"),
-            true,
-            &var("SALADFINGERS_S3_ACCESS_KEY"),
-            &var("SALADFINGERS_S3_SECRET_KEY"),
-        )
-        .unwrap();
-
+    /// Presign a PUT, presign a GET for the same key, and byte-compare the round-tripped
+    /// body. Proves the SaladCloud data path works with no credentials on the wire (the
+    /// whole point of presigning).
+    async fn round_trip(backend: &S3Backend) {
         let key = "smoke/presign-round-trip.txt";
         let body = b"saladfingers presign round-trip".as_slice();
         let http = reqwest::Client::new();
@@ -211,5 +196,300 @@ mod tests {
             body,
             "round-trip mismatch"
         );
+    }
+
+    // --- ephemeral local Garage -------------------------------------------------
+
+    /// Fixed local-only secrets for the ephemeral instance. The server is 127.0.0.1-bound
+    /// and lives only for the test, so these need not be secret — they just must not be
+    /// empty. `rpc_secret` must be 32 bytes (64 hex chars) — Garage validates the length.
+    const RPC_SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const ADMIN_TOKEN: &str = "sf-test-admin-token-0123456789abcdef";
+
+    /// A running ephemeral Garage instance. The `_`-prefixed fields are guards, owned
+    /// only for their `Drop`: `_server` is kill_on_drop so the garage process dies when
+    /// the test ends, and `_dir` (declared after, so it drops after the kill) then
+    /// deletes the config/metadata/data dirs. The endpoint + credentials come back as
+    /// plain fields — deliberately not via `SALADFINGERS_S3_*` env vars, which would
+    /// need `unsafe` to set and would shadow whatever the developer's shell has sourced.
+    struct GarageInstance {
+        _server: tokio::process::Child,
+        _dir: TempDir,
+        endpoint: String,
+        bucket: String,
+        access_key: String,
+        secret_key: String,
+    }
+
+    /// Reserve a free loopback port by binding `127.0.0.1:0` and dropping the listener —
+    /// the same trick `free_agent_port()` in the agent proxy tests uses. Best-effort: the
+    /// port is free at the moment of binding, not guaranteed to stay free.
+    fn free_loopback_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    /// Resolve the garage binary path: `SALADFINGERS_GARAGE_BIN` first (set by Nix), else
+    /// `"garage"` from `PATH`. Returns `None` if not found so the test can self-skip.
+    fn garage_bin() -> Option<String> {
+        if let Ok(p) = std::env::var("SALADFINGERS_GARAGE_BIN")
+            && !p.trim().is_empty()
+        {
+            return Some(p);
+        }
+        // Probe PATH for a bare `garage`.
+        if let Ok(paths) = std::env::var("PATH") {
+            for dir in paths.split(':') {
+                if std::path::Path::new(dir).join("garage").is_file() {
+                    return Some("garage".to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Run a `garage -c <cfg> <args…>` command and return its stdout, failing the test on
+    /// a non-zero exit. Stderr is inherited so server-side errors surface in `cargo test`
+    /// output.
+    async fn garage_cmd(cfg: &str, args: &[&str]) -> String {
+        let bin = garage_bin().expect("garage binary resolved before provisioning");
+        let mut cmd = tokio::process::Command::new(&bin);
+        cmd.arg("-c")
+            .arg(cfg)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        let output = cmd.output().await.expect("spawning garage CLI");
+        assert!(
+            output.status.success(),
+            "garage {:?} failed with status {}",
+            args,
+            output.status
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// Boot an ephemeral 127.0.0.1-bound Garage, provision a cluster layout + bucket + key,
+    /// and hand back the endpoint + credentials the test needs. Returns `None` (after
+    /// printing "skipping:") when the garage binary is unavailable, so a bare `cargo test`
+    /// without garage installed passes instead of failing.
+    ///
+    /// # Panics
+    /// Panics on any other failure (port/config/provisioning) — those are real bugs, not
+    /// "garage missing", and should fail loudly.
+    async fn local_garage_or_skip() -> Option<GarageInstance> {
+        let dir = tempfile::tempdir().expect("creating garage tempdir");
+        let metadata_dir = dir.path().join("meta");
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&metadata_dir).expect("creating metadata dir");
+        std::fs::create_dir_all(&data_dir).expect("creating data dir");
+
+        let s3_port = free_loopback_port();
+        let rpc_port = free_loopback_port();
+        let admin_port = free_loopback_port();
+        let config_path = dir.path().join("garage.toml");
+
+        // Bucket name unique per run to dodge collisions with a stale lingering instance.
+        // S3 bucket names are DNS labels: lowercase a-z, 0-9, hyphens, and must not start
+        // or end with a hyphen/dot. The tempdir name (e.g. `.tmpS3BoCZ`) isn't a valid label
+        // on its own, so sanitize it down to `[a-z0-9-]`, strip leading/trailing hyphens,
+        // and fall back to `run` if nothing usable remains.
+        let suffix: String = dir
+            .path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| {
+                let s: String = n
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() {
+                            c.to_ascii_lowercase()
+                        } else {
+                            '-'
+                        }
+                    })
+                    .collect();
+                let s = s.trim_matches('-').to_string();
+                if s.is_empty() { "run".to_string() } else { s }
+            })
+            .unwrap_or_else(|| "run".to_string());
+        let bucket = format!("saladfingers-smoke-{suffix}");
+
+        let toml = format!(
+            r#"
+metadata_dir = "{metadata_dir}"
+data_dir = "{data_dir}"
+db_engine = "sqlite"
+replication_factor = 1
+rpc_bind_addr = "127.0.0.1:{rpc_port}"
+rpc_public_addr = "127.0.0.1:{rpc_port}"
+rpc_secret = "{RPC_SECRET}"
+
+[s3_api]
+api_bind_addr = "127.0.0.1:{s3_port}"
+s3_region = "garage"
+
+[s3_web]
+bind_addr = "127.0.0.1:0"
+root_domain = ".garage.web"
+
+[admin]
+api_bind_addr = "127.0.0.1:{admin_port}"
+admin_token = "{ADMIN_TOKEN}"
+"#,
+            metadata_dir = metadata_dir.display(),
+            data_dir = data_dir.display(),
+        );
+        std::fs::write(&config_path, toml).expect("writing garage.toml");
+        let config_path = config_path
+            .to_str()
+            .expect("config path is utf-8")
+            .to_string();
+
+        let bin = match garage_bin() {
+            Some(b) => b,
+            None => {
+                eprintln!("skipping: garage binary not found");
+                return None;
+            }
+        };
+
+        let mut server = tokio::process::Command::new(&bin)
+            .arg("-c")
+            .arg(&config_path)
+            .arg("server")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawning garage server");
+        // Take the pipe handles out of the child and drain them in the background so the
+        // OS pipe buffers can't fill and stall the server. The `server` Child itself stays
+        // owned by `local_garage_or_skip` (and, via the returned struct, the test) so its
+        // `kill_on_drop` reaps the process when the test ends.
+        let stdout = server.stdout.take().expect("stdout");
+        let stderr = server.stderr.take().expect("stderr");
+        tokio::spawn(async move {
+            let mut stdout = stdout;
+            let mut stderr = stderr;
+            let mut buf_out = [0u8; 4096];
+            let mut buf_err = [0u8; 4096];
+            loop {
+                tokio::select! {
+                    r = stdout.read(&mut buf_out) => match r { Ok(0) | Err(_) => break, _ => {} },
+                    r = stderr.read(&mut buf_err) => match r { Ok(0) | Err(_) => break, _ => {} },
+                }
+            }
+        });
+
+        // Poll the S3 API port until Garage accepts connections (~15s budget).
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if tokio::net::TcpStream::connect(("127.0.0.1", s3_port))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("garage S3 port did not come up on 127.0.0.1:{s3_port}");
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        // Provision the cluster layout, then the bucket + key. `garage server` (the
+        // nixpkgs 1.x version has no `--single-node` flag) starts unconfigured; without an
+        // applied layout every admin RPC fails with "could not reach quorum", so assign
+        // this node a role and apply it before creating anything. Newer garage versions
+        // that accept `--single-node` would fold these steps in; this path is a superset
+        // that works across both.
+        let node_id = garage_cmd(&config_path, &["node", "id"])
+            .await
+            .lines()
+            .next()
+            .and_then(|l| l.split('@').next())
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("garage node id printed no node id"));
+        garage_cmd(
+            &config_path,
+            &["layout", "assign", "-c", "1G", "-z", "dc1", &node_id],
+        )
+        .await;
+        garage_cmd(&config_path, &["layout", "apply", "--version", "1"]).await;
+
+        garage_cmd(&config_path, &["bucket", "create", &bucket]).await;
+        let key_out = garage_cmd(&config_path, &["key", "create", "sf-test-key"]).await;
+        let access_key = parse_field(&key_out, "key id").expect("parsing garage access key");
+        let secret_key = parse_field(&key_out, "secret key").expect("parsing garage secret key");
+        garage_cmd(
+            &config_path,
+            &[
+                "bucket",
+                "allow",
+                "--read",
+                "--write",
+                &bucket,
+                "--key",
+                "sf-test-key",
+            ],
+        )
+        .await;
+
+        Some(GarageInstance {
+            _server: server,
+            _dir: dir,
+            endpoint: format!("http://127.0.0.1:{s3_port}"),
+            bucket,
+            access_key,
+            secret_key,
+        })
+    }
+
+    /// Parse a field from `garage key create` output. The CLI prints lines like
+    /// `Key ID: GK...` and `Secret key: ...` (label casing/spacing varies across garage
+    /// versions), so match case-insensitively on the label, then take the colon-delimited
+    /// value.
+    fn parse_field(out: &str, label: &str) -> Option<String> {
+        let label = label.to_ascii_lowercase();
+        for line in out.lines() {
+            let line = line.trim();
+            let lower = line.to_ascii_lowercase();
+            if lower.strip_prefix(&label).is_some() {
+                // The lowercase `lower` lines up with `line` at the same offsets; find
+                // the first ':' after the label in the original and take what follows.
+                let after_label = &line[label.len()..];
+                if let Some(idx) = after_label.find(':') {
+                    let v = after_label[idx + ':'.len_utf8()..].trim();
+                    if !v.is_empty() {
+                        return Some(v.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Presign round-trip against an **ephemeral local Garage** booted inside the test —
+    /// no real backend, no real credentials, no `~/.config/saladfingers/env.sh`
+    /// dependency, keeping the "no deployment details in the repo" property. Self-skips
+    /// (prints "skipping:") when the garage binary is unavailable, so a bare `cargo test`
+    /// without garage still passes.
+    #[tokio::test]
+    async fn presign_round_trip() {
+        let Some(garage) = local_garage_or_skip().await else {
+            return;
+        };
+        let backend = S3Backend::new(
+            &garage.endpoint,
+            "garage",
+            &garage.bucket,
+            true,
+            &garage.access_key,
+            &garage.secret_key,
+        )
+        .unwrap();
+        round_trip(&backend).await;
     }
 }
