@@ -43,15 +43,21 @@
     } @ args: let
       targetSystem = pkgs.stdenv.hostPlatform.system;
       nativeSystem = nativePkgs.stdenv.hostPlatform.system;
+      # sf-agent is the one piece of *compiled* x86_64-linux content in an image, so it is
+      # the only thing that still needs a Linux builder when a Mac assembles one. On
+      # aarch64-darwin, take the cross-compiled agent instead (an aarch64-darwin
+      # derivation targeting x86_64-linux — see nix/package.nix), which removes that last
+      # dependency and lets a Mac build an image entirely on its own. Its ELF headers are
+      # made identical to the native agent's, so the image closure is unchanged in shape.
+      # Every other host keeps the plain native agent.
+      sfAgent =
+        if nativeSystem == "aarch64-darwin" && targetSystem == "x86_64-linux"
+        then self.packages.${nativeSystem}.sf-agent-linux
+        else self.packages.${targetSystem}.sf-agent;
     in
       import ./nix/image-lib.nix {
-        inherit pkgs nativePkgs;
+        inherit pkgs nativePkgs sfAgent;
         n2c = inputs.nix2container.packages.${nativeSystem}.nix2container;
-        # Baked into the image, so always the TARGET system's binary. When the agent is
-        # not substitutable (any workspace edit — crane's src is the whole workspace),
-        # building it still needs an x86_64-linux builder; the next commit removes that
-        # by cross-compiling it from darwin.
-        sfAgent = self.packages.${targetSystem}.sf-agent;
       } (builtins.removeAttrs args ["pkgs" "nativePkgs"]);
 
     # The flake-parts module over mkSaladImage. Bound here rather than read back from
