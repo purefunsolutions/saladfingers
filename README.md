@@ -108,11 +108,22 @@ name come from the module, `sf-agent` and nix2container from saladfingers' own
 locked inputs, so a consumer needs neither in their flake. saladfingers builds its
 own images through the same module (`nix/images.nix`).
 
+## Platforms
+
+The CLI runs on Linux and macOS, x86_64 and aarch64. Only `image push` needs Nix — every
+other command is a plain binary speaking HTTPS, so a machine with no Nix can still run,
+serve, and collect results as long as it deploys by literal image reference.
+
+Images are always linux/amd64 (SaladCloud runs nothing else), but **a Mac builds and
+pushes them natively, with no Linux builder** — a Nix image is assembled from prebuilt
+binaries, so only the assembly glue has to be native. See [macos.md](docs/macos.md) for
+why, and [platforms.md](docs/platforms.md) for non-NixOS and no-Nix setups.
+
 Docs live under [`docs/`](docs/): SaladCloud facts, [session &
-serve](docs/serve.md) usage, image/layer policy, registry and storage runbooks, the
-macOS cross-build story, the empirical node findings, and the
-[security model](docs/security.md) — trust boundaries plus the two assumptions that
-follow from never putting a credential inside a container.
+serve](docs/serve.md) usage, image/layer policy, registry and storage runbooks,
+[macOS](docs/macos.md) and [platform](docs/platforms.md) support, the empirical node
+findings, and the [security model](docs/security.md) — trust boundaries plus the two
+assumptions that follow from never putting a credential inside a container.
 
 ## License
 

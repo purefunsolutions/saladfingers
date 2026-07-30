@@ -138,6 +138,19 @@ nix build .#packages.x86_64-linux.gpu-probe-image     # build a manifest (no pus
 saladfingers image push gpu-probe --tag v1            # build + skopeo push, record digest
 ```
 
+### Which system builds the image
+
+Images are **declared** once, under `saladfingers.imageSystem` (default `x86_64-linux` —
+SaladCloud runs nothing else), but `<name>-image` is **emitted in every system** of your
+flake. The extra variants are the same linux/amd64 image assembled by a different host:
+`packages.aarch64-darwin.gpu-probe-image` is what lets a Mac build and push one with no
+Linux builder at all. See [macos.md](macos.md) for why that is sound.
+
+`image push` picks the system for you — the darwin attribute on macOS, `x86_64-linux`
+elsewhere — because `.copyTo` is an executable of the system it was built under and must
+be one this machine can run. Override it with `--system`, `SALADFINGERS_IMAGE_SYSTEM`, or
+`[build] image_system`; `--on <ssh-host>` builds and pushes on a remote instead.
+
 ## The image lockfile
 
 `image push` records the pushed digest in `saladfingers-images.lock` at the root of
