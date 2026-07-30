@@ -47,37 +47,71 @@ pub const MIN_DECOMPRESS_LIMIT: u64 = 1024 * 1024 * 1024;
 /// this quickly is treated as dead (retried, then the run reallocates).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Read-stall timeout. reqwest resets this on every successful read, so it fires only when
-/// a connection delivers no bytes for this long — a genuinely stalled node, never a
-/// slow-but-alive one. Deliberately NOT a total-request deadline: a healthy multi-GB part
-/// must be allowed to take exactly as long as its honest bandwidth needs.
-const READ_STALL_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// TCP keepalive so a peer that dies mid-upload — the write side, which `read_timeout` does
-/// not cover — is noticed in tens of seconds, not the kernel's ~15 min default.
+/// TCP keepalive. With no read timeout (see [`transfer_client`]) this is the
+/// mechanism that notices a peer which died mid-transfer, in tens of seconds
+/// rather than the kernel's ~15 min default. It measures the CONNECTION, not
+/// the transfer's duration, so it cannot mistake a large upload for a broken
+/// one.
 const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 
 /// Per-part transfer attempts before giving up. A single transient blip (5xx, dropped
-/// connection, read stall) must not torch a whole multi-part artifact.
+/// connection, dropped peer) must not torch a whole multi-part artifact.
 const MAX_TRANSFER_ATTEMPTS: u32 = 4;
 
 /// An HTTP client tuned for large artifact transfers.
 ///
-/// It detects a dead or stalled node aggressively — connect timeout, read-stall timeout,
-/// TCP keepalive — but imposes **no total-request deadline**. A total `.timeout()` caps
-/// sustained throughput at `part_size / timeout`: the bug this replaces pinned a 4 GiB
-/// part at ~115 Mbps regardless of the node, so any checkpoint or output that could not
-/// move inside 300 s could never upload at all. The transfer engine must never use one.
+/// No total-request deadline, and — because this client serves uploads too —
+/// **no read timeout either**. Both are the same trap in different clothes: any
+/// cap on how long a transfer may take is a cap on how large a transfer may be.
+///
+/// The total `.timeout()` went first, after it pinned a 4 GiB part at ~115 Mbps
+/// regardless of the node. `.read_timeout()` then reintroduced the identical
+/// failure in the upload direction, because during a PUT the client is
+/// *writing* and receives nothing until the server answers the completed body.
+/// Time-since-last-received-byte therefore grows monotonically through a
+/// perfectly healthy upload and trips at 120 s — meaning an artifact that could
+/// not be uploaded within 120 s could never be uploaded at all.
+///
+/// This was not hypothetical. An 880 MB checkpoint (77M params: 294 MB of
+/// weights plus 588 MB of AdamW moments) failed four identical attempts spaced
+/// exactly 121 s apart, from a node with a healthy network, against an nginx
+/// already configured with `client_max_body_size 0`, `proxy_request_buffering
+/// off` and 3600 s proxy timeouts. Checkpointing had never worked for a model
+/// big enough to need it.
+///
+/// A dead peer is still caught, by TCP keepalive and the connect timeout —
+/// mechanisms that watch the CONNECTION rather than the transfer's duration,
+/// and so cannot confuse a big upload with a broken one.
 ///
 /// # Errors
 /// Returns an error if the TLS backend fails to initialize.
 pub fn transfer_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
-        .read_timeout(READ_STALL_TIMEOUT)
         .tcp_keepalive(TCP_KEEPALIVE)
         .build()
 }
+
+/// Deadline for one control-plane request: the job spec, the attempts ledger, the result
+/// envelope, checkpoint metadata. Apply it per request with `.timeout(CONTROL_TIMEOUT)`.
+///
+/// [`transfer_client`] deliberately carries no timeout of any kind, and the SAME client
+/// serves these. That is right for a blob whose size is not known in advance and wrong for
+/// a JSON document of a few kilobytes: without a bound here, a storage endpoint that
+/// accepts the connection and then never answers hangs the agent for the whole of the run's
+/// max duration and bills every second of it. TCP keepalive does not cover this — it
+/// notices a peer that DIED, not one that is alive and simply not replying.
+///
+/// This does not reintroduce the trap that removed the read timeout. That bound was a cap
+/// on how long a *transfer* could take, and so a cap on how large one could be; these
+/// requests carry a fixed, small body, so bounding them bounds no size at all.
+///
+/// The bandwidth-gate samples are deliberately NOT given this deadline. They are small
+/// transfers, not fixed-size documents: tens of MiB on precisely the slow node the gate
+/// exists to detect can legitimately take longer than any control deadline, and timing
+/// them out would misread "slow, which is what I am here to measure" as "hung". A dead
+/// peer mid-sample is still caught by keepalive and the connect timeout.
+pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Storage key for part `index` of the artifact named `name`.
 ///
@@ -655,6 +689,61 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (base, store)
+    }
+
+    /// A per-request timeout must bound a hung endpoint even though the client itself
+    /// has none — the whole basis for [`CONTROL_TIMEOUT`].
+    ///
+    /// The trap it guards is a server that ACCEPTS the connection and then never
+    /// answers. `transfer_client` carries no timeout at all, and TCP keepalive does
+    /// not help here: the peer is alive, it just is not replying. Without the
+    /// per-request bound the agent waits on a JSON document for the whole of the run's
+    /// max duration, billing every second. A short timeout stands in for the real 60 s
+    /// so the test costs milliseconds.
+    #[tokio::test]
+    async fn a_per_request_timeout_bounds_a_hung_endpoint() {
+        use axum::routing::get;
+
+        let app = axum::Router::new().route(
+            "/hang",
+            get(|| async {
+                // Longer than any patience this test has; never actually completes.
+                tokio::time::sleep(Duration::from_secs(300)).await;
+                "never"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // The real client: no total timeout, no read timeout.
+        let http = transfer_client().unwrap();
+        let started = std::time::Instant::now();
+        let err = http
+            .get(format!("{base}/hang"))
+            .timeout(Duration::from_millis(200))
+            .send()
+            .await
+            .expect_err("a hung endpoint must not be waited on forever");
+
+        assert!(err.is_timeout(), "expected a timeout, got {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "took {:?} — the per-request timeout did not apply",
+            started.elapsed()
+        );
+        // And the other direction, which is what makes the bound load-bearing rather
+        // than decorative: WITHOUT a per-request timeout the same request is still
+        // pending, because nothing in the client will ever stop it.
+        let unbounded = tokio::time::timeout(
+            Duration::from_millis(500),
+            http.get(format!("{base}/hang")).send(),
+        )
+        .await;
+        assert!(
+            unbounded.is_err(),
+            "the client is supposed to have no timeout of its own; something bounded it"
+        );
     }
 
     #[tokio::test]

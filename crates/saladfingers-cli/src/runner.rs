@@ -467,6 +467,13 @@ pub(crate) fn spawn_reaper(run_id: &str, org: &str, project: &str) -> Result<()>
 const ENV_VALUE_MAX: usize = 960;
 /// The agent reassembles `SF_JOB_URL` + `SF_JOB_URL_1..=9` (ten segments max).
 const JOB_URL_MAX_PARTS: usize = 10;
+/// How long to let an envelope arrive after the group looks finished or gone. The agent
+/// writes its envelope and the group disappears moments later, so the two can cross.
+const ENVELOPE_GRACE: Duration = Duration::from_secs(5);
+/// Consecutive 404s tolerated before a never-yet-seen group counts as gone (~1 minute at
+/// the poll interval). Only creation lag justifies waiting at all; a group that existed
+/// and then 404s is deleted, and no amount of waiting brings it back.
+const MISSING_GROUP_TOLERANCE: u32 = 6;
 
 /// The container environment for one shard's `sf-agent run`.
 ///
@@ -599,6 +606,13 @@ async fn await_and_collect(
                 eprintln!("  shard {shard}: group failed (no envelope) — keeping it for forensics");
                 print_system_logs(client, &name).await;
             }
+            ShardOutcome::Vanished => {
+                worst = worst.max(1);
+                eprintln!(
+                    "  shard {shard}: container group no longer exists (cancelled, reaped, or \
+                     deleted elsewhere) and no result was written"
+                );
+            }
         }
         shard_spans.push(spans);
     }
@@ -691,6 +705,8 @@ fn finalize_run(
 enum ShardOutcome {
     Envelope(Box<ResultEnvelope>),
     Failed,
+    /// The container group is gone from the control plane and no envelope ever appeared.
+    Vanished,
 }
 
 /// Accumulates per-machine running spans for one shard as the poll loop observes the
@@ -797,6 +813,18 @@ impl SpanTracker {
     }
 }
 
+/// Whether a 404 on the polled group should end the wait.
+///
+/// A group the control plane has already acknowledged can only 404 because it was
+/// deleted — by `cancel`, by the reaper, or by hand — and a deleted group never comes
+/// back, never runs, and never writes a result. Waiting on one is pure billing-clock and
+/// operator time. The single case that deserves patience is the opposite one: a group so
+/// newly created that it is not visible yet, which is why a never-yet-seen group gets a
+/// bounded number of retries before the same verdict.
+const fn group_is_gone(seen_group: bool, missing_polls: u32) -> bool {
+    seen_group || missing_polls >= MISSING_GROUP_TOLERANCE
+}
+
 /// The `machine_id` of the instance currently in `running`, if any. A shard group is
 /// single-replica, so there is at most one instance.
 fn running_machine_id(instances: &[Instance]) -> Option<String> {
@@ -823,6 +851,10 @@ async fn await_shard(
     let start = Instant::now();
     let mut last = String::new();
     let mut tracker = SpanTracker::default();
+    // Whether the control plane has ever acknowledged this group. Once it has, a later
+    // 404 can only mean deletion; before that it may still be a creation not yet visible.
+    let mut seen_group = false;
+    let mut missing_polls = 0u32;
     // Adopt spans a previous process already observed (attach after a crash/detach),
     // so its billed time survives into the final estimate instead of being overwritten.
     if let Ok(Some(run)) = state::load_run(run_id)
@@ -840,8 +872,33 @@ async fn await_shard(
         // A transient control-plane error must not abandon a live, billing run: log it and
         // keep polling (like `list_instances` below). The hard cap still bounds a run whose
         // control plane is genuinely, persistently unreachable.
+        //
+        // A 404 is different in kind: the group is *gone*, so nothing will ever run under
+        // that name again and no envelope can appear. Treating it as transient made the
+        // CLI poll a cancelled run ~400 times over 70 minutes before the hard cap fired —
+        // for a deletion it had performed itself.
         let status = match client.get_container_group(&name).await {
-            Ok(group) => group.status().unwrap_or(GroupStatus::Unknown),
+            Ok(group) => {
+                seen_group = true;
+                group.status().unwrap_or(GroupStatus::Unknown)
+            }
+            Err(e) if e.is_not_found() => {
+                missing_polls += 1;
+                // Two races argue against bailing on the first 404, so give each a grace:
+                // the job may have finished and had its group reaped between our envelope
+                // check and this poll, and a just-created group may not be visible yet.
+                tokio::time::sleep(ENVELOPE_GRACE).await;
+                if let Ok(Some(env)) = fetch_envelope(http, &result_get).await {
+                    tracker.finalize_with_envelope(&env);
+                    return Ok((ShardOutcome::Envelope(Box::new(env)), tracker.into_spans()));
+                }
+                if group_is_gone(seen_group, missing_polls) {
+                    tracker.close();
+                    tracing::warn!("container group {name} is gone and wrote no result");
+                    return Ok((ShardOutcome::Vanished, tracker.into_spans()));
+                }
+                GroupStatus::Unknown
+            }
             Err(e) => {
                 tracing::warn!("poll of {name} failed: {e:#}; retrying");
                 GroupStatus::Unknown
@@ -864,7 +921,7 @@ async fn await_shard(
         }
         if matches!(status, GroupStatus::Failed) {
             // Grace: the envelope may still be arriving.
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(ENVELOPE_GRACE).await;
             if let Ok(Some(env)) = fetch_envelope(http, &result_get).await {
                 tracker.finalize_with_envelope(&env);
                 return Ok((ShardOutcome::Envelope(Box::new(env)), tracker.into_spans()));
@@ -1021,6 +1078,7 @@ async fn fetch_envelope(http: &reqwest::Client, url: &str) -> Result<Option<Resu
     // can turn a poll failure into a leaked capability.
     let resp = http
         .get(url)
+        .timeout(transfer::CONTROL_TIMEOUT)
         .send()
         .await
         .map_err(reqwest::Error::without_url)?;
@@ -1036,6 +1094,7 @@ async fn put_object(http: &reqwest::Client, url: &str, body: Vec<u8>) -> Result<
     // text. This error propagates out of `run`, and `main` returns `anyhow::Result`, so
     // `Termination` prints it with `Debug` — the whole source chain — into stderr/CI logs.
     http.put(url)
+        .timeout(transfer::CONTROL_TIMEOUT)
         .body(body)
         .send()
         .await
@@ -1080,6 +1139,26 @@ fn summary(
         t.add_row(vec!["reallocations".to_string(), reallocations.to_string()]);
     }
     print_table(&t);
+}
+
+/// Host RAM in GiB when neither the flag nor the profile names one.
+const DEFAULT_MEMORY_GB: u32 = 16;
+
+/// Host RAM in MiB from a GiB figure.
+///
+/// The multiplication is checked because the product is a `u32` and 4194304 GiB
+/// overflows it: a debug build panics, and a release build — the one that ships —
+/// silently requests **0 MiB**, while a fat-fingered extra zero wraps to some
+/// unrelated size. A flag whose entire purpose is to prevent a silent OOM must not
+/// have a silent failure of its own. The profile's `memory_gb` comes through here too.
+fn memory_mb(gib: Option<u32>) -> Result<u32> {
+    let gib = gib.unwrap_or(DEFAULT_MEMORY_GB);
+    gib.checked_mul(1024).with_context(|| {
+        format!(
+            "memory of {gib} GiB is out of range (at most {} GiB)",
+            u32::MAX / 1024
+        )
+    })
 }
 
 fn resolve_params(cfg: &Config, profile: Option<&Profile>, args: &RunArgs) -> Result<RunParams> {
@@ -1181,7 +1260,11 @@ fn resolve_params(cfg: &Config, profile: Option<&Profile>, args: &RunArgs) -> Re
         image,
         gpu_classes,
         cpu: profile.and_then(|p| p.cpu).unwrap_or(8),
-        memory_mb: profile.and_then(|p| p.memory_gb).unwrap_or(16) * 1024,
+        // An explicit --memory-gb beats the profile, the same rule --replicas
+        // uses below. HOST RAM, not VRAM: too little and the host OOM-kills
+        // the container with exit 137, and a benchmark restarted mid-flight
+        // then reports degraded numbers that look entirely ordinary.
+        memory_mb: memory_mb(args.memory_gb.or_else(|| profile.and_then(|p| p.memory_gb)))?,
         disk_gib: profile.and_then(|p| p.disk_gb).unwrap_or(20) + 5, // spool headroom
         shm_mb: profile.and_then(|p| p.shm_mb),
         priority,
@@ -1286,6 +1369,118 @@ fn save_state(cfg: &Config, run_id: &str, params: &RunParams, groups: &[GroupRef
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_deleted_group_ends_the_wait_immediately() {
+        // Seen once, then gone: cancelled or reaped. Nothing will run under that name
+        // again, so the first 404 is the answer — this is the case that used to poll a
+        // dead group for over an hour.
+        assert!(group_is_gone(true, 1));
+    }
+
+    #[test]
+    fn a_group_never_yet_seen_gets_a_bounded_grace() {
+        // Creation may not be visible yet, so tolerate a while — but not forever.
+        assert!(!group_is_gone(false, 1));
+        assert!(!group_is_gone(false, MISSING_GROUP_TOLERANCE - 1));
+        assert!(group_is_gone(false, MISSING_GROUP_TOLERANCE));
+    }
+
+    /// A `Config` with nothing configured — the parts `resolve_params` reads are
+    /// the defaults and the profile, not the org/key/storage.
+    pub(super) fn bare_config() -> Config {
+        Config {
+            organization: "org".into(),
+            project: "proj".into(),
+            api_key: saladfingers_api::Secret::new("k"),
+            storage: None,
+            registry: None,
+            defaults: crate::config::Defaults::default(),
+            profiles: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// `RunArgs` as clap would build it, so the flag's own wiring is under test
+    /// too — a `--memory-gb` that never reaches `RunArgs` would satisfy any
+    /// hand-constructed struct.
+    pub(super) fn run_args(extra: &[&str]) -> RunArgs {
+        // `example.invalid` cannot appear in a lockfile, so image resolution is
+        // a pass-through and this test does not depend on the working tree.
+        let mut argv = vec![
+            "saladfingers",
+            "run",
+            "--image",
+            "example.invalid/img:t",
+            "--gpu-class",
+            "rtx 4090 (24 gb)",
+        ];
+        argv.extend_from_slice(extra);
+        argv.extend_from_slice(&["--", "true"]); // `run` requires a command
+        use clap::Parser as _;
+        match crate::cli::Cli::parse_from(argv).command {
+            crate::cli::Command::Run(args) => args,
+            other => panic!("expected `run`, parsed {other:?}"),
+        }
+    }
+
+    /// `--memory-gb` overrides the profile in BOTH directions.
+    ///
+    /// The direction that matters is DOWN, and it is the one a `max()` would get
+    /// wrong — the bug `--replicas` carried, where a profile could only ever be
+    /// raised. Getting this wrong is quiet: too little host RAM and the host
+    /// OOM-kills the container (exit 137), the platform restarts it, and a
+    /// benchmark killed mid-flight reports degraded numbers that look ordinary.
+    #[test]
+    fn memory_gb_overrides_the_profile_in_both_directions() {
+        let cfg = bare_config();
+        let mem = |profile_gb: Option<u32>, flag: &[&str]| {
+            let profile = profile_gb.map(|gb| Profile {
+                memory_gb: Some(gb),
+                ..Profile::default()
+            });
+            resolve_params(&cfg, profile.as_ref(), &run_args(flag))
+                .expect("resolve_params")
+                .memory_mb
+        };
+
+        assert_eq!(
+            mem(None, &[]),
+            DEFAULT_MEMORY_GB * 1024,
+            "neither: the 16 GiB default"
+        );
+        assert_eq!(mem(Some(40), &[]), 40 * 1024, "profile alone applies");
+        assert_eq!(mem(None, &["--memory-gb", "40"]), 40 * 1024, "flag alone");
+        assert_eq!(
+            mem(Some(80), &["--memory-gb", "40"]),
+            40 * 1024,
+            "the flag must LOWER the profile too, not just raise it"
+        );
+        assert_eq!(
+            mem(Some(8), &["--memory-gb", "40"]),
+            40 * 1024,
+            "and raise it"
+        );
+    }
+
+    /// A GiB figure that overflows `u32` MiB must be an error, not a silent 0.
+    ///
+    /// Release builds do not check arithmetic, so before this the shipping binary
+    /// turned `--memory-gb 4194304` into a request for **0 MiB** and a
+    /// fat-fingered extra zero into some unrelated size, while debug builds
+    /// panicked outright.
+    #[test]
+    fn memory_out_of_range_is_an_error_not_a_wrapped_size() {
+        assert_eq!(memory_mb(None).unwrap(), DEFAULT_MEMORY_GB * 1024);
+        assert_eq!(memory_mb(Some(40)).unwrap(), 40 * 1024);
+        // The largest representable figure still works...
+        assert_eq!(memory_mb(Some(u32::MAX / 1024)).unwrap(), 4_294_966_272);
+        // ...and one more GiB is refused, by name.
+        let e = memory_mb(Some(u32::MAX / 1024 + 1))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("out of range"), "{e}");
+        assert!(memory_mb(Some(40_000_000)).is_err(), "a fat-fingered zero");
+    }
 
     fn timings_at(start: DateTime<Utc>, exec_end_secs: i64, with_outputs: bool) -> Timings {
         Timings {

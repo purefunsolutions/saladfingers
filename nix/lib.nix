@@ -32,6 +32,31 @@ in
       # We ship test binaries, not cargo state.
       doInstallCargoArtifacts = false;
 
+      # Keep the build-only closure out of the image. Nix decides what an output depends
+      # on by scanning it for store-path strings, and a Rust binary is full of them that
+      # are not real dependencies: std's panic messages carry the toolchain's source
+      # paths, and vendored crate sources appear the same way. Nothing references them at
+      # run time, but the scanner cannot know that, so without scrubbing they drag the
+      # whole Rust toolchain (~2 GB) and the vendored sources (~276 MB) into every image
+      # built from these binaries — measured downstream as a 4.1 GB image that is 1.3 GB
+      # once scrubbed.
+      #
+      # `craneLib.buildPackage` adds these two hooks itself; `mkCargoDerivation` does not,
+      # which is exactly why harvesting test binaries this way needed them added by hand.
+      # They install themselves into `postInstallHooks`, so they run after the install
+      # phase below without it having to call anything.
+      #
+      # Only the toolchain and vendored sources are blanked. Genuine runtime deps — the
+      # CUDA/ROCm userspace each binary's RUNPATH points at — are untouched, including
+      # libraries reached by `dlopen` (cudarc opens libcublasLt by soname), which is why
+      # this cannot be replaced with a blanket reference scrub.
+      nativeBuildInputs =
+        (commonArgs.nativeBuildInputs or [])
+        ++ [
+          craneLib.removeReferencesToRustToolchainHook
+          craneLib.removeReferencesToVendoredSourcesHook
+        ];
+
       # Compile the test harnesses (no execution — the GPU is on the rented node)
       # and record the compiler's JSON so we can find the executables.
       buildPhaseCargoCommand = ''

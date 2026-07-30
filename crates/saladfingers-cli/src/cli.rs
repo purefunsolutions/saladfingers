@@ -185,6 +185,15 @@ pub struct RunArgs {
     /// GPU class name or UUID (repeatable = first-available).
     #[arg(long = "gpu-class", long_help = GPU_CLASS_HELP)]
     pub gpu_classes: Vec<String>,
+    /// Host RAM in GiB. Overrides the profile; default 16.
+    ///
+    /// This is HOST RAM, not VRAM — the GPU class fixes VRAM. It gets a flag
+    /// rather than staying profile-only because the failure it prevents is
+    /// silent and expensive: the host OOM-kills the container, the run reports
+    /// **exit 137**, and a benchmark that was killed and restarted mid-flight
+    /// comes back with degraded numbers that look entirely ordinary.
+    #[arg(long = "memory-gb")]
+    pub memory_gb: Option<u32>,
     /// Number of shards (each a single-replica group). Given explicitly, it overrides
     /// the profile in BOTH directions — a profile's 8 with `--replicas 2` runs 2, not 8.
     /// Default: the profile's value, else 1.
