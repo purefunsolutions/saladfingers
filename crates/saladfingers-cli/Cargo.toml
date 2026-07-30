@@ -47,3 +47,11 @@ tempfile = { workspace = true }
 [dev-dependencies]
 wiremock = { workspace = true }
 axum = { workspace = true }
+tokio = { workspace = true, features = [
+  "rt-multi-thread",
+  "macros",
+  "process",
+  "net",
+  "time",
+  "io-util",
+] }
