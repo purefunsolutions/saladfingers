@@ -30,14 +30,29 @@
     # Build a saladfingers image with the caller's pkgs + CUDA/ROCm userspace,
     # reusing saladfingers' prebuilt sf-agent and nix2container. Closing over *this*
     # flake's `self`/`inputs` is what lets a consumer skip both.
-    mkSaladImage = {pkgs, ...} @ args: let
-      system = pkgs.stdenv.hostPlatform.system;
+    #
+    # `pkgs` is the image's TARGET platform, `nativePkgs` (default: `pkgs`) the platform
+    # assembling it — see nix/image-lib.nix. The two instances are picked apart here:
+    # nix2container supplies the assembly derivations, so it comes from the NATIVE system;
+    # sf-agent is baked into the image and must be a TARGET binary. That single split is
+    # what lets an aarch64-darwin host produce a linux/amd64 image with no Linux builder.
+    mkSaladImage = {
+      pkgs,
+      nativePkgs ? pkgs,
+      ...
+    } @ args: let
+      targetSystem = pkgs.stdenv.hostPlatform.system;
+      nativeSystem = nativePkgs.stdenv.hostPlatform.system;
     in
       import ./nix/image-lib.nix {
-        inherit pkgs;
-        n2c = inputs.nix2container.packages.${system}.nix2container;
-        sfAgent = self.packages.${system}.sf-agent;
-      } (builtins.removeAttrs args ["pkgs"]);
+        inherit pkgs nativePkgs;
+        n2c = inputs.nix2container.packages.${nativeSystem}.nix2container;
+        # Baked into the image, so always the TARGET system's binary. When the agent is
+        # not substitutable (any workspace edit — crane's src is the whole workspace),
+        # building it still needs an x86_64-linux builder; the next commit removes that
+        # by cross-compiling it from darwin.
+        sfAgent = self.packages.${targetSystem}.sf-agent;
+      } (builtins.removeAttrs args ["pkgs" "nativePkgs"]);
 
     # The flake-parts module over mkSaladImage. Bound here rather than read back from
     # `config.flake.flakeModules` (which `imports` may not do) so this flake can both

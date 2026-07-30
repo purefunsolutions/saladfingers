@@ -15,6 +15,11 @@ ci-image:
   interruptible: true
   script:
     - nix build -L .#packages.x86_64-linux.gpu-probe-image
+    # The darwin-native image path (a Mac assembling the same linux/amd64 image with no
+    # Linux builder — see docs/macos.md). Evaluation is host-independent, so this Linux
+    # runner catches a broken darwin path without a macOS runner; only the build itself
+    # would need one.
+    - nix eval --raw .#packages.aarch64-darwin.gpu-probe-image.drvPath
 # macOS build disabled for now (no macOS runner). Re-enable when one is available:
 # ci-macos:
 #   stage: ci
