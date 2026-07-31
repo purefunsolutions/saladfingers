@@ -65,6 +65,9 @@ pub async fn run(cfg: Config, args: RunArgs) -> Result<()> {
         .transpose()?
         .cloned();
     let params = resolve_params(&cfg, profile.as_ref(), &args)?;
+    // Before anything is uploaded or any group is created: a run that cannot pull
+    // its own image should cost nothing.
+    deploy::check_registry_auth(&cfg, &params.image)?;
     let storage = cfg
         .storage
         .as_ref()
@@ -615,7 +618,7 @@ async fn await_and_collect(
             ShardOutcome::Failed => {
                 worst = worst.max(1);
                 eprintln!("  shard {shard}: group failed (no envelope) — keeping it for forensics");
-                print_system_logs(client, &name).await;
+                print_failure_reason(client, &name).await;
             }
             ShardOutcome::Vanished => {
                 worst = worst.max(1);
@@ -1069,6 +1072,27 @@ async fn cleanup(client: &SaladClient, run_id: &str, shard_count: u32) {
         let _ = client.stop_container_group(&name).await;
         let _ = deploy::delete_group(client, &name).await;
     }
+}
+
+/// Everything the control plane will say about why a group failed.
+///
+/// `current_state.description` comes first because it is usually the entire
+/// answer and nothing else surfaces it. A group that fails before its container
+/// ever starts — an image the node could not pull, say — has no system log
+/// entries and no envelope, so without this the CLI reports "group failed (no
+/// envelope)" and the actual reason ("Access Denied, Check Permissions") is
+/// reachable only by hand-querying the API. That happened, and it cost a run
+/// plus a long detour to diagnose.
+async fn print_failure_reason(client: &SaladClient, name: &str) {
+    if let Ok(group) = client.get_container_group(name).await
+        && let Some(description) = group
+            .current_state
+            .as_ref()
+            .and_then(|s| s.description.as_deref())
+    {
+        eprintln!("    reason: {description}");
+    }
+    print_system_logs(client, name).await;
 }
 
 async fn print_system_logs(client: &SaladClient, name: &str) {

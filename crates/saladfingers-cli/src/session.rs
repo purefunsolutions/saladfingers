@@ -56,6 +56,9 @@ pub async fn create(cfg: Config, args: SessionCreateArgs) -> Result<()> {
         args.image.as_deref(),
         profile.as_ref().and_then(|p| p.image.as_deref()),
     )?;
+    // Before any group is created: a session that cannot pull its own image should
+    // cost nothing — and it bills for as long as it is left up, not for one job.
+    deploy::check_registry_auth(&cfg, &image)?;
     let mut gpu_classes = args.gpu_classes.clone();
     if gpu_classes.is_empty() {
         gpu_classes = profile

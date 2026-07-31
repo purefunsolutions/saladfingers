@@ -70,18 +70,92 @@ pub fn parse_priority(s: &str) -> Result<ContainerPriority> {
     }
 }
 
+/// Fail now if `image` comes from the configured private registry and the
+/// credentials to pull it are missing.
+///
+/// [`registry_auth`] answers `None` when the credentials are unavailable, which creates
+/// the group with no authentication at all. The node then fails to pull and SaladCloud
+/// reports "Access Denied, Check Permissions" half a minute later, through a
+/// channel that carries no log entries and no result envelope. Everything needed
+/// to prevent that is local: the config names the env vars, and the environment
+/// either holds them or does not.
+///
+/// This asks exactly the question [`registry_auth`] answers — an unnamed
+/// `username_env` counts as missing, not as "nothing to check" — because a check
+/// that is satisfied where the builder gives up guards nothing.
+///
+/// Note the asymmetry this corrects — `image push` already refuses eagerly when
+/// its credentials are absent ("no registry push username — set …"). Pull was the
+/// silent one.
+///
+/// # Errors
+/// Returns an error naming the env var that is missing, or the config key that
+/// never named one.
+pub fn check_registry_auth(cfg: &Config, image: &str) -> anyhow::Result<()> {
+    check_registry_auth_with(cfg, image, |name| std::env::var(name).ok())
+}
+
+fn check_registry_auth_with(
+    cfg: &Config,
+    image: &str,
+    env: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<()> {
+    let Some(registry) = cfg.registry.as_ref() else {
+        return Ok(());
+    };
+    // Only images from the configured registry need its credentials; a public
+    // image pulled from anywhere else must not be blocked by them.
+    if !image_is_from(&registry.base, image) {
+        return Ok(());
+    }
+    for (which, var) in [
+        ("username", registry.username_env.as_deref()),
+        ("password", registry.password_env.as_deref()),
+    ] {
+        let Some(var) = var else {
+            anyhow::bail!(
+                "[registry].{which}_env names no environment variable, but the image comes \
+                 from the private registry {}. The group would be created with no pull \
+                 credentials at all and the node would fail with \"Access Denied, Check \
+                 Permissions\"",
+                registry.base
+            );
+        };
+        let present = env(var).is_some_and(|v| !v.trim().is_empty());
+        anyhow::ensure!(
+            present,
+            "registry {which} env var ${var} is empty or unset, but the image comes from \
+             the private registry {}. The node would fail to pull it with \"Access Denied, \
+             Check Permissions\" only after the group had been created",
+            registry.base
+        );
+    }
+    Ok(())
+}
+
+/// Whether `image` names a repository under `base`.
+///
+/// A bare `starts_with` is a substring test, not a boundary test: with
+/// `base = registry.example.com/org/imgs` it also matches the neighbouring
+/// `…/imgs-public/tool`, gating a genuinely public image on private credentials.
+fn image_is_from(base: &str, image: &str) -> bool {
+    // A trailing slash in the config must not un-gate the registry: with it left in,
+    // the stripped remainder starts with the repository name instead of `/` and every
+    // image under the base stops matching.
+    let base = base.trim_end_matches('/');
+    let Some(rest) = image.strip_prefix(base) else {
+        return false;
+    };
+    // The base repository itself (`base`, `base:tag`, `base@digest`) or one below it.
+    rest.is_empty() || rest.starts_with(['/', ':', '@'])
+}
+
 /// Build `registry_authentication` from the config's `[registry]` section, if set.
 #[must_use]
 pub fn registry_auth(cfg: &Config) -> Option<RegistryAuthentication> {
     let registry = cfg.registry.as_ref()?;
-    let user = registry
-        .username_env
-        .as_ref()
-        .and_then(|e| std::env::var(e).ok())?;
-    let password = registry
-        .password_env
-        .as_ref()
-        .and_then(|e| std::env::var(e).ok())?;
+    let user = env_credential(registry.username_env.as_deref())?;
+    let password = env_credential(registry.password_env.as_deref())?;
     Some(RegistryAuthentication {
         basic: Some(BasicAuth {
             username: user,
@@ -89,6 +163,21 @@ pub fn registry_auth(cfg: &Config) -> Option<RegistryAuthentication> {
         }),
         docker_hub: None,
     })
+}
+
+/// A trimmed, non-empty credential from the named variable, or `None`.
+///
+/// The emptiness rule has to match [`check_registry_auth`]'s: with a bare
+/// `std::env::var(e).ok()` an `export REG_USER=` reaches SaladCloud as a basic-auth
+/// username of `""`, which the check has already called missing.
+fn env_credential(var: Option<&str>) -> Option<String> {
+    env_credential_from(var, |name| std::env::var(name).ok())
+}
+
+fn env_credential_from(var: Option<&str>, env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    env(var?)
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// Parameters for a probe/session-style single-replica group.
@@ -281,5 +370,147 @@ fn instance_state_label(s: InstanceState) -> &'static str {
         InstanceState::Running => "running",
         InstanceState::Stopping => "stopping",
         InstanceState::Unknown => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RegistryConfig;
+
+    fn cfg_with_registry() -> Config {
+        Config {
+            organization: "o".into(),
+            project: "p".into(),
+            api_key: saladfingers_api::Secret::new("k"),
+            storage: None,
+            registry: Some(RegistryConfig {
+                base: "registry.example.com/org/imgs".into(),
+                auth_kind: Some("basic".into()),
+                username_env: Some("REG_USER".into()),
+                password_env: Some("REG_PASS".into()),
+                push_username_env: None,
+                push_password_env: None,
+            }),
+            build: crate::config::BuildConfig::default(),
+            defaults: Default::default(),
+            profiles: Default::default(),
+        }
+    }
+
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |name: &str| {
+            owned
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        }
+    }
+
+    const PRIVATE: &str = "registry.example.com/org/imgs/kernel-test@sha256:abc";
+
+    #[test]
+    fn a_private_image_without_pull_credentials_is_refused_before_submitting() {
+        let err = check_registry_auth_with(&cfg_with_registry(), PRIVATE, env_of(&[]))
+            .expect_err("must not create a group that cannot pull its image");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("REG_USER"),
+            "should name the missing var: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_empty_credential_counts_as_missing() {
+        // `export REG_PASS=` is a real way to get here, and it fails exactly the
+        // same way on the node as leaving it unset.
+        let env = env_of(&[("REG_USER", "u"), ("REG_PASS", "   ")]);
+        let err = check_registry_auth_with(&cfg_with_registry(), PRIVATE, env).unwrap_err();
+        assert!(format!("{err}").contains("REG_PASS"));
+    }
+
+    #[test]
+    fn credentials_present_means_go() {
+        let env = env_of(&[("REG_USER", "u"), ("REG_PASS", "p")]);
+        assert!(check_registry_auth_with(&cfg_with_registry(), PRIVATE, env).is_ok());
+    }
+
+    #[test]
+    fn a_public_image_is_not_blocked_by_private_registry_credentials() {
+        // The credentials belong to one registry; an image from anywhere else
+        // neither needs nor should be gated by them.
+        let ok = check_registry_auth_with(
+            &cfg_with_registry(),
+            "docker.io/library/ubuntu:24.04",
+            env_of(&[]),
+        );
+        assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn a_neighbouring_repository_is_not_gated_by_the_private_registrys_credentials() {
+        // `imgs-public` shares a prefix with `imgs` and nothing else. Gating it
+        // would refuse a run that would have pulled perfectly well.
+        let ok = check_registry_auth_with(
+            &cfg_with_registry(),
+            "registry.example.com/org/imgs-public/tool:1",
+            env_of(&[]),
+        );
+        assert!(ok.is_ok(), "{:?}", ok.unwrap_err());
+
+        // The base repository itself, tagged, is still inside the boundary.
+        let err = check_registry_auth_with(
+            &cfg_with_registry(),
+            "registry.example.com/org/imgs:latest",
+            env_of(&[]),
+        );
+        assert!(err.is_err(), "the registry's own repository must be gated");
+    }
+
+    #[test]
+    fn a_trailing_slash_in_the_config_base_still_gates_the_registry() {
+        // `base = "…/imgs/"` is a config shape, not an error, and stripping it as-is
+        // leaves a remainder that starts with the repository name instead of `/` —
+        // silently turning the guard off for every image it exists to gate.
+        let mut cfg = cfg_with_registry();
+        cfg.registry.as_mut().unwrap().base = "registry.example.com/org/imgs/".into();
+        let err = check_registry_auth_with(&cfg, PRIVATE, env_of(&[]));
+        assert!(err.is_err(), "a trailing slash must not un-gate the base");
+    }
+
+    #[test]
+    fn a_credential_var_that_was_never_named_is_refused_like_a_missing_one() {
+        // `registry_auth` gives up on an unnamed var and creates the group with no
+        // authentication at all — the exact outcome this check exists to prevent, so
+        // it cannot be the one case that passes.
+        let mut cfg = cfg_with_registry();
+        cfg.registry.as_mut().unwrap().username_env = None;
+        let err = check_registry_auth_with(&cfg, PRIVATE, env_of(&[("REG_PASS", "p")]))
+            .expect_err("an unnamed username_env is a missing credential");
+        let msg = format!("{err}");
+        assert!(msg.contains("username_env"), "should name the key: {msg}");
+    }
+
+    #[test]
+    fn an_exported_but_empty_credential_is_never_sent_as_a_username() {
+        // Both halves of the pair have to agree on "present": `export REG_USER=`
+        // must not reach SaladCloud as a basic-auth username of "".
+        assert_eq!(
+            env_credential_from(Some("REG_USER"), env_of(&[("REG_USER", "   ")])),
+            None
+        );
+        assert_eq!(env_credential_from(Some("REG_USER"), env_of(&[])), None);
+        assert_eq!(
+            env_credential_from(None, env_of(&[("REG_USER", "u")])),
+            None
+        );
+        assert_eq!(
+            env_credential_from(Some("REG_USER"), env_of(&[("REG_USER", " tok\n")])),
+            Some("tok".to_string()),
+        );
     }
 }
