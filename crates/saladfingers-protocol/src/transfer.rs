@@ -454,7 +454,9 @@ pub async fn download_artifact(
     }
     // Verify integrity before decoding. Parts overwrite fixed keys, so a node that died
     // mid-upload can leave a torn, mixed-generation stream; without this check a corrupt
-    // reassembly would extract silently (checkpoints) or hand the caller garbage.
+    // reassembly would extract silently or hand the caller garbage. Checkpoints rotate
+    // between ring slots now, so a torn one no longer replaces the restorable copy — but
+    // it can still be the slot being *written*, and outputs overwrite in place regardless.
     if let Some(expected) = expected_sha256 {
         let path = temp.path().to_path_buf();
         let actual = tokio::task::spawn_blocking(move || sha256_file(&path)).await??;

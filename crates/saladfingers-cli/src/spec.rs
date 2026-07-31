@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use saladfingers_protocol::transfer::part_key;
 use saladfingers_protocol::{
-    BandwidthGate, CheckpointSpec, ControlUrls, JobSpec, PROTOCOL_VERSION, TransferIn, TransferOut,
+    BandwidthGate, CheckpointSlot, CheckpointSpec, ControlUrls, JobSpec, PROTOCOL_VERSION,
+    TransferIn, TransferOut,
 };
 
 use crate::presign::S3Backend;
@@ -26,6 +27,17 @@ pub const DEFAULT_MAX_PARTS: u32 = 64;
 /// Hard ceiling for a configured `max_artifact_parts` (4096 × 4 GiB = 16 TiB). Clamps the
 /// setting so a mistaken value cannot bloat every job spec or the collector's work.
 pub const MAX_ARTIFACT_PARTS_LIMIT: u32 = 4096;
+
+/// Size of the checkpoint slot ring.
+///
+/// Two is the minimum that satisfies the invariant "never write the slot the committed
+/// metadata references", and the minimum is what we want: retention is one complete
+/// checkpoint, and each slot costs another `3 × max_parts` presigned URLs in the job spec
+/// (PUT, GET and DELETE per part) — 192 per slot at the default `max_parts` of 64, 384
+/// for the ring. A third
+/// slot would buy nothing: the agent never has more than one upload in flight, so at most
+/// two slots are ever live (the committed one and the one being written).
+pub const CHECKPOINT_SLOTS: u32 = 2;
 
 /// An input the runner has already uploaded (with GET URLs for exactly its parts).
 pub struct UploadedInput {
@@ -116,6 +128,23 @@ pub fn job_key(run_id: &str, shard: u32) -> String {
     format!("{}/job.json", shard_prefix(run_id, shard))
 }
 
+/// The storage key stem of one checkpoint slot, under a shard's `base` prefix.
+///
+/// Both sides of the ring call this: [`build_job_spec`] mints the agent's presigned URLs
+/// from it, and `checkpoint fetch` re-derives the same keys to read a slot back. Two
+/// literals would let the producer's layout drift from the consumer's while both sides'
+/// tests kept passing and every fetch 404'd.
+#[must_use]
+pub fn ckpt_slot_stem(base: &str, slot: u32) -> String {
+    format!("{base}/ckpt/slot{slot}/data")
+}
+
+/// The storage key of a shard's checkpoint metadata — the object that names the live slot.
+#[must_use]
+pub fn ckpt_meta_key(base: &str) -> String {
+    format!("{base}/ckpt/meta.json")
+}
+
 /// Build a shard's [`JobSpec`] with every URL presigned.
 #[must_use]
 pub fn build_job_spec(params: SpecParams) -> JobSpec {
@@ -173,22 +202,34 @@ pub fn build_job_spec(params: SpecParams) -> JobSpec {
     });
 
     let checkpoint = params.checkpoint.map(|cp| {
-        // Fixed part keys → re-uploads overwrite (keep-latest-remote). The metadata
-        // object is written last and read first, so a restore only sees a complete set.
-        let stem = format!("{base}/ckpt/data");
-        let meta_key = format!("{base}/ckpt/meta.json");
+        // A ring of slots, not one fixed key set: the agent always uploads to a slot the
+        // committed metadata does NOT reference, so an upload cut short by a dying node
+        // cannot damage the checkpoint that is currently restorable. The metadata object
+        // is still written last and read first, and it now names the slot it describes.
+        let meta_key = ckpt_meta_key(&base);
+        let slots = (0..CHECKPOINT_SLOTS)
+            .map(|slot| {
+                let stem = ckpt_slot_stem(&base, slot);
+                CheckpointSlot {
+                    put_urls: (0..max_parts)
+                        .map(|k| backend.presign_put(&part_key(&stem, k), expiry))
+                        .collect(),
+                    get_urls: (0..max_parts)
+                        .map(|k| backend.presign_get(&part_key(&stem, k), expiry))
+                        .collect(),
+                    delete_urls: (0..max_parts)
+                        .map(|k| backend.presign_delete(&part_key(&stem, k), expiry))
+                        .collect(),
+                }
+            })
+            .collect();
         CheckpointSpec {
             glob: cp.dir,
             interval_secs: cp.interval_secs,
             quiesce_secs: cp.quiesce_secs,
-            put_urls: (0..max_parts)
-                .map(|k| backend.presign_put(&part_key(&stem, k), expiry))
-                .collect(),
+            slots,
             meta_put_url: backend.presign_put(&meta_key, expiry),
             meta_get_url: backend.presign_get(&meta_key, expiry),
-            get_urls: (0..max_parts)
-                .map(|k| backend.presign_get(&part_key(&stem, k), expiry))
-                .collect(),
         }
     });
 
@@ -279,10 +320,20 @@ mod tests {
         let ckpt = spec.checkpoint.expect("checkpoint built");
         assert_eq!(ckpt.glob, "/work/ckpt");
         assert_eq!(ckpt.interval_secs, 30);
-        assert_eq!(ckpt.put_urls.len() as u32, 8);
-        assert_eq!(ckpt.get_urls.len() as u32, 8);
+        assert_eq!(ckpt.slots.len() as u32, CHECKPOINT_SLOTS);
         assert!(ckpt.meta_put_url.contains("ckpt/meta.json"));
-        assert!(ckpt.put_urls[0].contains("ckpt/data"));
         assert!(ckpt.meta_get_url.contains("X-Amz-Signature"));
+        for (index, slot) in ckpt.slots.iter().enumerate() {
+            // Every slot is fully addressable — read it back, write it, and reclaim it.
+            assert_eq!(slot.put_urls.len() as u32, 8);
+            assert_eq!(slot.get_urls.len() as u32, 8);
+            assert_eq!(slot.delete_urls.len() as u32, 8);
+            // Distinct key space per slot: overlapping keys would defeat the whole point.
+            let key = format!("ckpt/slot{index}/data");
+            assert!(slot.put_urls[0].contains(&key), "{}", slot.put_urls[0]);
+            assert!(slot.get_urls[0].contains(&key));
+            assert!(slot.delete_urls[0].contains(&key));
+            assert!(slot.delete_urls[0].contains("X-Amz-Signature"));
+        }
     }
 }

@@ -10,6 +10,7 @@
 
 pub mod admin;
 pub mod bench;
+pub mod checkpoint;
 pub mod cli;
 pub mod commands;
 pub mod config;
@@ -30,7 +31,10 @@ pub mod tunnel;
 
 use anyhow::Result;
 
-use cli::{BenchCommand, Cli, Command, CostCommand, ImageCommand, ServeCommand, SessionCommand};
+use cli::{
+    BenchCommand, CheckpointCommand, Cli, Command, CostCommand, ImageCommand, ServeCommand,
+    SessionCommand,
+};
 use config::Config;
 
 /// Initialize tracing. Logs go to stderr so stdout stays clean for `--json` output.
@@ -72,6 +76,10 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Command::Cancel(args) => runner::cancel(resolve()?, args).await,
         Command::Reap(args) => runner::reap(resolve()?, args).await,
         Command::Logs(args) => logs::logs(resolve()?, args).await,
+        Command::Checkpoint(sub) => match sub {
+            CheckpointCommand::Show(args) => checkpoint::show(resolve()?, args).await,
+            CheckpointCommand::Fetch(args) => checkpoint::fetch(resolve()?, args).await,
+        },
         Command::Gc(args) => admin::gc(resolve()?, args).await,
         Command::Session(sub) => match sub {
             SessionCommand::Create(args) => session::create(resolve()?, args).await,

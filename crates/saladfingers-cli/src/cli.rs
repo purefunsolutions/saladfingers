@@ -104,6 +104,9 @@ pub enum Command {
     Reap(RunIdArgs),
     /// Query a run's logs (works after group deletion).
     Logs(LogsArgs),
+    /// Inspect or download a run's uploaded checkpoint.
+    #[command(subcommand)]
+    Checkpoint(CheckpointCommand),
     /// Garbage-collect leftover container groups.
     Gc(GcArgs),
     /// Interactive GPU dev session.
@@ -347,6 +350,40 @@ pub struct LogsArgs {
     /// the platform query covers every shard's group at once.
     #[arg(long, default_value_t = 0, requires = "uploaded")]
     pub shard: u32,
+}
+
+/// Checkpoint subcommands.
+///
+/// The agent writes checkpoints into a rotating slot, so which key holds the current one
+/// is not predictable from the run id alone — the metadata object is the index, and these
+/// commands are how an operator reads it.
+#[derive(Debug, Subcommand)]
+pub enum CheckpointCommand {
+    /// Show the uploaded checkpoint's metadata (step, size, age) without downloading it.
+    Show(CheckpointArgs),
+    /// Download and extract the uploaded checkpoint.
+    Fetch(CheckpointFetchArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CheckpointArgs {
+    /// Run identifier (e.g. `sf-x7k2mq`).
+    pub run_id: String,
+    /// Shard whose checkpoint to read.
+    #[arg(long, default_value_t = 0)]
+    pub shard: u32,
+    /// Emit JSON instead of a table.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CheckpointFetchArgs {
+    #[command(flatten)]
+    pub target: CheckpointArgs,
+    /// Directory to extract into. Defaults to `./sf-out/<run-id>/<shard>/ckpt`.
+    #[arg(long)]
+    pub dest: Option<String>,
 }
 
 #[derive(Debug, Args)]

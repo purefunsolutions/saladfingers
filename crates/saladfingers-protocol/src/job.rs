@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// A single unit of work for one shard on one rented node.
@@ -98,15 +99,87 @@ pub struct CheckpointSpec {
     /// A checkpoint is uploaded once no member file changed within this window.
     #[serde(default = "default_quiesce_secs")]
     pub quiesce_secs: u64,
-    /// Presigned PUT URLs for the latest checkpoint's part series (overwrite = keep-latest).
-    pub put_urls: Vec<String>,
+    /// The slot ring. A checkpoint is written to a slot that is NOT the live one,
+    /// so an interrupted upload cannot damage the checkpoint currently referenced
+    /// by the metadata. See [`CheckpointSlot`].
+    pub slots: Vec<CheckpointSlot>,
     /// Presigned PUT URL for the checkpoint metadata (written last, atomically).
     pub meta_put_url: String,
     /// Presigned GET URL for the checkpoint metadata (resume path).
     pub meta_get_url: String,
-    /// Presigned GET URLs for the latest checkpoint's part series (resume path).
-    #[serde(default)]
+}
+
+/// One slot of the checkpoint ring: a complete, independently addressable part
+/// series.
+///
+/// The ring exists because the previous design overwrote a single fixed key set
+/// every interval. Writing the data parts first and the metadata last made a
+/// torn write *detectable* — restore verifies `sha256` before extracting — but
+/// it could not make the previous checkpoint *survivable*: once the new data
+/// PUT landed, the old bytes were gone, so a node dying in the window before
+/// the metadata commit left `data(N+1)` under `meta(N)`, a checksum mismatch,
+/// and a run that restarts from step 0. On a 30k-step job that is days of work.
+///
+/// With a ring, the commit is not merely atomic but non-destructive: until the
+/// metadata names the new slot, the old slot is still complete and still
+/// referenced.
+///
+/// The agent holds no storage credentials — it only ever receives presigned
+/// URLs — so it cannot mint keys for a step number that was unknown at submit
+/// time. The CLI therefore presigns a fixed, small ring up front and the agent
+/// rotates through it, recording the step in the checkpoint metadata rather than
+/// in the key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointSlot {
+    /// Presigned PUT URLs for this slot's part series.
+    pub put_urls: Vec<String>,
+    /// Presigned GET URLs for the same parts (restore path).
+    ///
+    /// Required, like the other two: v2 has no v1 senders to tolerate, and a
+    /// defaulted-empty list would make restore report "artifact has no parts"
+    /// for a checkpoint that is sitting right there.
     pub get_urls: Vec<String>,
+    /// Presigned DELETE URLs, so a superseded slot can be reclaimed without
+    /// giving the node credentials. Retention is one complete checkpoint: after
+    /// a successful commit the agent deletes every slot the new metadata does
+    /// not reference.
+    ///
+    /// Required for the same reason, and one worse: an empty list makes
+    /// reclamation *silently* succeed — sweeping zero keys, recording the slot
+    /// as empty, and logging a reclamation that never happened.
+    pub delete_urls: Vec<String>,
+}
+
+/// Metadata written last (atomically) after a checkpoint's parts are uploaded — the
+/// commit. Its presence signals a complete checkpoint; `slot` says which slot of the ring
+/// holds it and `parts` how many of that slot's (fixed-count) part URLs actually hold
+/// data.
+///
+/// A wire message in both directions: the agent writes it, the agent's own restore path
+/// reads it back on the next node, and the CLI reads it to fetch a finished run's
+/// checkpoint (the key is no longer guessable by hand — it depends on the rotation).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointMeta {
+    /// Protocol version; equals [`crate::PROTOCOL_VERSION`].
+    pub v: u32,
+    /// Index into [`CheckpointSpec::slots`] holding this checkpoint's parts.
+    pub slot: u32,
+    /// Number of parts that hold data.
+    pub parts: u32,
+    /// Compressed byte count.
+    pub bytes: u64,
+    /// SHA-256 of the compressed stream.
+    pub sha256: String,
+    /// Training step this checkpoint represents, when the directory layout reveals it
+    /// (`step_<digits>` *directories*, as the infurer trainer writes — a job that names
+    /// its checkpoints as files reports no step). Informational: it lets
+    /// an operator see how far the remote checkpoint got without downloading it. The step
+    /// cannot live in the key — the agent holds no credentials and can only use URLs
+    /// presigned before the run started, when no step number was known yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<u64>,
+    /// When the checkpoint was uploaded.
+    pub uploaded_at: DateTime<Utc>,
 }
 
 fn default_quiesce_secs() -> u64 {

@@ -43,6 +43,37 @@ result envelope is written by the rented node — which is untrusted — so with
 checkpoints) are high-entropy and nowhere near 100×, so the guard never trips on legitimate
 data.
 
+## Checkpoints
+
+A run's checkpoint lives under `runs/<run-id>/<shard>/ckpt/`:
+
+```
+ckpt/meta.json          the commit record — which slot is current, its step and sha256
+ckpt/slot0/data.tzst.*  ┐ the ring: one of these holds the current checkpoint,
+ckpt/slot1/data.tzst.*  ┘ the other is free for the next upload
+```
+
+The agent **alternates** between the slots and rewrites `meta.json` only after the new
+slot's parts have all landed. That ordering is what makes an interruption survivable: a
+node that dies mid-upload leaves a half-written *free* slot, while `meta.json` still points
+at the previous, complete one, so the replacement node resumes from it. (Overwriting one
+fixed key set instead — the pre-v2 layout — made a torn upload detectable via the checksum
+but not recoverable: the old bytes were already gone, and the run restarted from step 0.)
+Retention is one checkpoint; the superseded slot's parts are deleted right after the commit,
+using presigned DELETE URLs, since the node holds no credentials.
+
+Because the live slot depends on how many times the run rotated, read the checkpoint through
+the CLI rather than by guessing a key:
+
+```bash
+saladfingers checkpoint show sf-x7k2mq            # step, size, age — no download
+saladfingers checkpoint fetch sf-x7k2mq --dest ./ckpt
+```
+
+`fetch` verifies the sha256 before extracting anything. It works after the run has ended and
+after its container groups are gone — which is the point, since the checkpoint of an
+interrupted run is worth more than the output of a finished one.
+
 ## Options
 
 ### Cloudflare R2 (recommended public default)

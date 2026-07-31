@@ -86,6 +86,20 @@ impl S3Backend {
             .to_string()
     }
 
+    /// Presign a DELETE URL for `key`, valid for `expires`.
+    ///
+    /// Handed to the agent so it can reclaim a superseded checkpoint slot. The agent
+    /// holds no credentials by design, and `delete_prefix` below needs them (it lists
+    /// the bucket first), so slot reclamation has to travel as a presigned URL like
+    /// every other storage operation the agent performs.
+    #[must_use]
+    pub fn presign_delete(&self, key: &str, expires: Duration) -> String {
+        self.bucket
+            .delete_object(Some(&self.credentials), key)
+            .sign(expires)
+            .to_string()
+    }
+
     /// Delete every object under `prefix`, returning the count deleted. Used by `gc` to
     /// reap a finished run's remote artifacts. Best-effort: individual delete failures
     /// are skipped, not fatal.
@@ -196,6 +210,77 @@ mod tests {
             body,
             "round-trip mismatch"
         );
+
+        // The DELETE leg is what reclaims a superseded checkpoint slot on a node that
+        // holds no credentials. Only a real S3 endpoint can tell that URL apart from a
+        // GET's: signing the wrong verb still yields a plausible URL with a signature in
+        // it, and the only symptom in production would be every reclaim 403ing into a
+        // warn on a node whose logs nobody reads — retention silently becoming forever.
+        let del = backend.presign_delete(key, Duration::from_secs(300));
+        let resp = http.delete(&del).send().await.unwrap();
+        assert!(
+            resp.status().is_success(),
+            "DELETE failed: {}",
+            resp.status()
+        );
+        let gone = http.get(&get).send().await.unwrap();
+        assert_eq!(
+            gone.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "object survived its presigned DELETE"
+        );
+
+        // The same three verbs, minted by `build_job_spec` itself. Nothing offline can
+        // tell which verb a URL was signed for — the method lives in the signature, not
+        // the query — so a copy-paste slip that fills `delete_urls` from `presign_get`
+        // yields URLs every string assertion accepts and every DELETE 403s, silently.
+        // Only a real endpoint refuses the wrong verb, so each list is exercised here.
+        let spec = crate::spec::build_job_spec(crate::spec::SpecParams {
+            backend,
+            run_id: "sf-verbs1",
+            shard_index: 0,
+            shard_count: 1,
+            command: vec!["true".into()],
+            env: std::collections::BTreeMap::new(),
+            inputs: &[],
+            outputs: &[],
+            max_parts: 1,
+            max_duration_secs: None,
+            stop_signal: None,
+            gate: None,
+            checkpoint: Some(crate::spec::CheckpointParams {
+                dir: "ckpt".into(),
+                interval_secs: 30,
+                quiesce_secs: 15,
+            }),
+            expiry: Duration::from_secs(300),
+        });
+        let ckpt = spec.checkpoint.expect("checkpoint spec");
+        let slot = &ckpt.slots[0];
+        let put = http
+            .put(&slot.put_urls[0])
+            .body(b"verb-check".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert!(put.status().is_success(), "spec put_urls: {}", put.status());
+        let got = http.get(&slot.get_urls[0]).send().await.unwrap();
+        assert!(got.status().is_success(), "spec get_urls: {}", got.status());
+        let del = http.delete(&slot.delete_urls[0]).send().await.unwrap();
+        assert!(
+            del.status().is_success(),
+            "spec delete_urls signed for the wrong verb: {}",
+            del.status()
+        );
+        let meta_put = http
+            .put(&ckpt.meta_put_url)
+            .body(b"{}".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert!(meta_put.status().is_success(), "spec meta_put_url");
+        let meta_got = http.get(&ckpt.meta_get_url).send().await.unwrap();
+        assert!(meta_got.status().is_success(), "spec meta_get_url");
     }
 
     // --- ephemeral local Garage -------------------------------------------------

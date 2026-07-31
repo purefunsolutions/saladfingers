@@ -5,8 +5,21 @@
 //! `sf-agent run` — one-shot batch job supervisor.
 //!
 //! Boot → fetch [`JobSpec`] → record attempt → idempotent-resume short-circuit →
-//! bandwidth gate → download inputs → restore checkpoint → exec (with the checkpoint
-//! watcher alongside) → upload outputs → write the [`ResultEnvelope`] commit record.
+//! probe checkpoint metadata → bandwidth gate → download inputs → restore checkpoint →
+//! exec (with the checkpoint watcher alongside) → upload outputs → write the
+//! [`ResultEnvelope`] commit record. The checkpoint is *probed* before the gate and the
+//! inputs but *extracted* after them: an unusable checkpoint must fail before the run
+//! spends a full input download on a boot that cannot proceed, while the extraction has
+//! to come after the inputs so a restored checkpoint wins any overlapping paths (an
+//! input may carry initial weights; the checkpoint carries later ones).
+//!
+//! Agent-assigned exit codes, distinct from the job's own: 3 = no usable job spec (no
+//! envelope — there is nowhere to write one); 4 = input download, or exec could not be
+//! spawned/waited on; 5 = output upload failed, or the envelope PUT itself failed (the
+//! one 5 that leaves nothing in storage); 6 = checkpoint probe/restore; 7 = the
+//! `--max-duration` timeout; 143 = interrupted by a platform stop. Every path except 3
+//! and the failed-envelope 5 writes an envelope first, so the CLI reports the reason
+//! rather than an unexplained restart.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -96,6 +109,33 @@ pub async fn run(_args: RunArgs) -> Result<()> {
     };
     let mut node = collect_node_info();
 
+    // Probe the checkpoint metadata BEFORE the gate and the inputs. A failure here is
+    // fatal, not a fresh start: without the metadata the ring does not know which slot
+    // is live, so the first upload can land on the committed one — and even when it
+    // rotates correctly, the commit that follows *reclaims* the other slot. Either path
+    // destroys the last good checkpoint, the exact loss the ring exists to prevent.
+    // Failing costs one relaunch cycle, bounded by the attempt cap above; each doomed
+    // relaunch stops HERE, at one small GET, rather than after re-downloading the full
+    // input set — the boot is in the billed `running` state the whole time, so what a
+    // permanently unreadable checkpoint burns per relaunch should be seconds, not an
+    // input transfer.
+    let probed = match crate::checkpoint::probe(&http, &spec).await {
+        Ok(probed) => probed,
+        Err(e) => {
+            tracing::error!("checkpoint probe failed: {e:#}");
+            let env = agent_error_envelope(
+                &spec,
+                &node,
+                &timings,
+                attempts.attempts.len(),
+                0,
+                format!("checkpoint restore: {e:#}"),
+            );
+            let _ = put_envelope(&http, &spec.urls.result_put, &env).await;
+            std::process::exit(6);
+        }
+    };
+
     // Bandwidth gate (may reallocate this instance and never return).
     let gate = run_gate(&http, &spec, &mut attempts).await;
     node.measured_down_mbps = gate.down_mbps;
@@ -118,20 +158,33 @@ pub async fn run(_args: RunArgs) -> Result<()> {
     }
     timings.inputs_done = Some(Utc::now());
 
-    // Restore the latest checkpoint (resume path), then run the watcher alongside exec.
-    if spec.checkpoint.is_some()
-        && let Err(e) = crate::checkpoint::restore(&http, &spec).await
-    {
-        tracing::warn!("checkpoint restore failed (continuing fresh): {e:#}");
-    }
+    // Extract the probed checkpoint (resume path), then run the watcher alongside exec.
+    // After the inputs on purpose: a restored checkpoint must win overlapping paths.
+    let restored = match crate::checkpoint::restore(&http, &spec, probed).await {
+        Ok(state) => state,
+        Err(e) => {
+            tracing::error!("checkpoint restore failed: {e:#}");
+            let env = agent_error_envelope(
+                &spec,
+                &node,
+                &timings,
+                attempts.attempts.len(),
+                gate.gate_reallocs,
+                format!("checkpoint restore: {e:#}"),
+            );
+            let _ = put_envelope(&http, &spec.urls.result_put, &env).await;
+            std::process::exit(6);
+        }
+    };
     let ckpt_stop = std::sync::Arc::new(tokio::sync::Notify::new());
     // Set when the child had to be SIGKILLed mid-stop: its final checkpoint writes are
-    // then suspect, and the watcher's final upload must not clobber the last good one.
+    // then suspect, and the watcher's final upload must not commit a torn directory.
     let ckpt_dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ckpt_watcher = spec.checkpoint.is_some().then(|| {
         crate::checkpoint::spawn_watcher(
             http.clone(),
             spec.clone(),
+            restored,
             ckpt_stop.clone(),
             ckpt_dirty.clone(),
         )
@@ -871,7 +924,18 @@ async fn load_spec(http: &reqwest::Client) -> Result<JobSpec> {
             bail!("job spec sha256 mismatch (expected {expected}, got {actual})");
         }
     }
-    serde_json::from_slice(&bytes).context("parsing JobSpec")
+    let spec: JobSpec = serde_json::from_slice(&bytes).context("parsing JobSpec")?;
+    // The version gate the protocol doc promises. Field-level serde only catches a skew
+    // whose shapes differ — a v1 spec with no checkpoint block is byte-identical to a v2
+    // one and would run to completion on silently mismatched semantics. Checking `v`
+    // makes every skew loud, at boot, with a message that says which side to change.
+    anyhow::ensure!(
+        spec.v == PROTOCOL_VERSION,
+        "job spec is protocol v{} but this agent speaks v{PROTOCOL_VERSION}; \
+         rebuild the image (or use the CLI that matches it)",
+        spec.v
+    );
+    Ok(spec)
 }
 
 async fn load_attempts(http: &reqwest::Client, spec: &JobSpec) -> Attempts {
