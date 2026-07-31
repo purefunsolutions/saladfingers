@@ -102,7 +102,8 @@ saladfingers run --expose-port 8080 -- ./train --dashboard-addr '[::]:8080'
   is deleted — a tunnel is only live while the job is.
 - **The gateway is created with `auth=true`.** Every request must carry `Salad-Api-Key`,
   so the port is never reachable from the public internet, and **a browser pointed at the
-  gateway URL gets 401** — a browser cannot attach a header to a navigation. That is what
+  gateway URL gets 403** — a browser cannot attach a header to a navigation. The edge
+  answers 403 for a missing key and a wrong one alike, whatever the User-Agent. That is what
   `tunnel` below is for. (`serve` uses `auth=false` instead, because its end users are
   meant to reach it and the app enforces its own auth — see [serve.md](serve.md).)
 - **The process must listen on IPv6 `[::]`.** The gateway answers **503** for a socket
@@ -182,7 +183,7 @@ saladfingers gc --older-than 24h --dry-run
 
 | symptom | cause | fix |
 | --- | --- | --- |
-| browser gets **401** on the gateway URL | `--expose-port` is `auth=true` | `saladfingers tunnel RUN_ID` |
+| browser gets **403** on the gateway URL | `--expose-port` is `auth=true` | `saladfingers tunnel RUN_ID` |
 | gateway answers **503** | the process bound `0.0.0.0` or loopback | bind `[::]:PORT` |
 | run reports **exit 137** | host OOM killed the container | raise `--memory-gb` |
 | group loops `downloading → creating` | the image is not amd64, or the command replaced an entrypoint it needed | see [empirical.md](empirical.md) |

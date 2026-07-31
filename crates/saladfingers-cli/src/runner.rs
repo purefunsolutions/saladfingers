@@ -896,7 +896,7 @@ async fn report_gateways(client: &SaladClient, run_id: &str, groups: &[GroupRef]
 /// What to tell the operator about an exposed shard.
 ///
 /// Deliberately NOT "open this URL": the gateway is authenticated, so pasting it into a
-/// browser returns 401. Print the command that actually works, and the loopback URL that
+/// browser returns 403. Print the command that actually works, and the loopback URL that
 /// command will serve on — from [`tunnel::browser_url`] and the same default the
 /// `--local-port` flag carries, so the advice cannot drift from the tool. Also say it
 /// answers only once the instance is up: the image still has to pull, and a 503 on the
@@ -908,7 +908,7 @@ fn watch_hint(run_id: &str, shard: u32, url: &str) -> String {
         format!(" --shard {shard}")
     };
     format!(
-        "run {run_id}: shard {shard} exposed at {url} (authenticated — a browser gets 401)\n  \
+        "run {run_id}: shard {shard} exposed at {url} (authenticated — a browser gets 403)\n  \
          watch it with:  saladfingers tunnel {run_id}{shard_flag}\n  \
          then open {}\n  \
          (serves once the instance reaches `running`; 503 until then)",
