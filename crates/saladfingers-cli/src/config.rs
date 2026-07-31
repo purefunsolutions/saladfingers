@@ -198,6 +198,11 @@ pub struct ProfileCheckpoint {
     /// A checkpoint uploads once no file changed within this many seconds.
     #[serde(default = "default_ckpt_quiesce")]
     pub quiesce_secs: u64,
+    /// Shared checkpoint name. Set it and every run of this profile continues the same
+    /// training instead of starting over; leave it unset and the checkpoint is reaped
+    /// together with the run that wrote it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
 }
 
 fn default_ckpt_interval() -> u64 {
@@ -508,6 +513,7 @@ shm_mb = 2048
 [profiles.train.checkpoint]
 dir = "ckpts"
 interval_secs = 120
+prefix = "tinystories-77m"
 
 [profiles.train.artifacts]
 push = ["ckpts/latest/**:model"]
@@ -526,6 +532,12 @@ pull = ["train.py"]
         assert_eq!(ckpt.dir, "ckpts");
         assert_eq!(ckpt.interval_secs, 120);
         assert_eq!(ckpt.quiesce_secs, 15, "default quiesce");
+        assert_eq!(
+            ckpt.prefix.as_deref(),
+            Some("tinystories-77m"),
+            "a profile is where a shared checkpoint name usually lives — it belongs to the \
+             training job, not to one invocation of it"
+        );
         let art = p.artifacts.as_ref().expect("artifacts section parsed");
         assert_eq!(art.push, vec!["ckpts/latest/**:model"]);
         assert_eq!(art.pull, vec!["train.py"]);

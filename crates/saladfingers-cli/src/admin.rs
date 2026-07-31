@@ -373,6 +373,20 @@ pub async fn gc(cfg: Config, args: GcArgs) -> Result<()> {
             Err(e) => eprintln!("skipping remote cleanup (storage unavailable): {e}"),
         }
     }
+
+    // Release what the reaped runs were holding. Local state is what `run` consults
+    // before letting a new run claim a `--checkpoint-prefix`; a run whose group gc just
+    // deleted would otherwise sit at "running" forever and block its prefix, with `gc` —
+    // the documented backstop for leaked runs — never being the thing that frees it.
+    for rid in &reaped_run_ids {
+        if let Ok(Some(mut run)) = state::load_run(rid) {
+            if crate::admin::is_terminal(&run.status) {
+                continue;
+            }
+            run.status = "reaped".into();
+            let _ = state::save_run(&run);
+        }
+    }
     Ok(())
 }
 
@@ -416,7 +430,7 @@ fn group_status_label(g: &ContainerGroup) -> String {
     .to_string()
 }
 
-fn is_terminal(status: &str) -> bool {
+pub(crate) fn is_terminal(status: &str) -> bool {
     matches!(
         status,
         "succeeded" | "failed" | "cancelled" | "deleted" | "reaped"

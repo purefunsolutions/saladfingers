@@ -143,6 +143,7 @@ pub async fn run(cfg: Config, args: RunArgs) -> Result<()> {
                 dir: c.dir.clone(),
                 interval_secs: c.interval_secs,
                 quiesce_secs: c.quiesce_secs,
+                prefix: c.prefix.clone(),
             }),
             expiry,
         });
@@ -832,6 +833,51 @@ impl SpanTracker {
     }
 }
 
+/// Refuse to start a run on a checkpoint prefix a live run is already using.
+///
+/// A shared prefix is one slot ring with one metadata object. Two runs rotating it
+/// concurrently would each treat the other's commit as its own history, overwrite the slot
+/// the other considers live, and produce checkpoints belonging to neither — and the damage
+/// only becomes visible when someone tries to resume from the result.
+///
+/// This reads local run state, so it catches the realistic mistake (the same operator
+/// launching twice) and not a run started from another machine. It is a guard rail, not a
+/// distributed lock — and not even a local one across the window between this check and
+/// the state write that claims the prefix: that write happens once the groups exist,
+/// which puts the whole input upload inside the window, so for a large corpus the prefix
+/// sits checkable-but-unclaimed for minutes.
+pub(crate) fn ensure_prefix_unclaimed(prefix: &str) -> Result<()> {
+    // Say so when the state cannot be read, rather than silently deciding the prefix is
+    // free: one unreadable file (a truncated write, a schema this build cannot decode)
+    // would otherwise turn the guard off with no sign that it had ever been on.
+    let runs = state::list_runs().unwrap_or_else(|e| {
+        eprintln!(
+            "warning: could not read local run state ({e:#}), so the checkpoint-prefix guard \
+             cannot run — check nothing else is using '{prefix}' before continuing"
+        );
+        Vec::new()
+    });
+    let claimed = runs.into_iter().find(|r| {
+        r.checkpoint_prefix.as_deref() == Some(prefix) && !crate::admin::is_terminal(&r.status)
+    });
+    if let Some(run) = claimed {
+        let state_file = state::run_path(&run.run_id).map_or_else(
+            |_| "its file under ~/.local/state/saladfingers/runs".to_string(),
+            |p| p.display().to_string(),
+        );
+        bail!(
+            "run {} ({}) is already using checkpoint prefix '{prefix}'. Two runs sharing a \
+             prefix overwrite each other's checkpoints — cancel it with `saladfingers cancel {}`, \
+             or pick another prefix. If that run is long gone and only its local state says \
+             otherwise, delete {state_file}",
+            run.run_id,
+            run.status,
+            run.run_id,
+        );
+    }
+    Ok(())
+}
+
 /// Whether a 404 on the polled group should end the wait.
 ///
 /// A group the control plane has already acknowledged can only 404 because it was
@@ -1374,6 +1420,13 @@ fn resolve_params(cfg: &Config, profile: Option<&Profile>, args: &RunArgs) -> Re
 
     // `--checkpoint` wins wholesale (with its own interval/quiesce flags); otherwise the
     // profile's `[profiles.<name>.checkpoint]` section applies.
+    //
+    // The profile's `prefix` goes with the profile's checkpoint section and does NOT leak
+    // into a CLI `--checkpoint`. Retention under a prefix is one checkpoint, so a one-off
+    // `--checkpoint /work/scratch` under a training profile would otherwise aim at the
+    // shared ring and its first commit would *reclaim* the real training checkpoint —
+    // silently, and with no way to get it back. Someone who does want a scratch directory
+    // writing to the shared name says so with `--checkpoint-prefix`.
     let checkpoint = args
         .checkpoint
         .as_ref()
@@ -1381,6 +1434,7 @@ fn resolve_params(cfg: &Config, profile: Option<&Profile>, args: &RunArgs) -> Re
             dir: dir.clone(),
             interval_secs: args.checkpoint_interval,
             quiesce_secs: args.checkpoint_quiesce,
+            prefix: args.checkpoint_prefix.clone(),
         })
         .or_else(|| {
             profile
@@ -1389,8 +1443,15 @@ fn resolve_params(cfg: &Config, profile: Option<&Profile>, args: &RunArgs) -> Re
                     dir: c.dir,
                     interval_secs: c.interval_secs,
                     quiesce_secs: c.quiesce_secs,
+                    prefix: args.checkpoint_prefix.clone().or(c.prefix),
                 })
         });
+    if let Some(prefix) = checkpoint.as_ref().and_then(|c| c.prefix.as_deref()) {
+        spec::validate_checkpoint_prefix(prefix)?;
+        ensure_prefix_unclaimed(prefix)?;
+    } else if args.checkpoint_prefix.is_some() {
+        bail!("--checkpoint-prefix needs --checkpoint (or a profile checkpoint) to apply to");
+    }
 
     // Artifact lists: CLI flags override the profile's `artifacts.pull`/`push` wholesale.
     let input_specs = if args.inputs.is_empty() {
@@ -1525,6 +1586,7 @@ fn save_state(cfg: &Config, run_id: &str, params: &RunParams, groups: &[GroupRef
         // Record the part ceiling this run presigned URLs for, so `attach` caps the untrusted
         // envelope at the same value regardless of any later `[storage]` config change.
         max_parts: Some(params.max_parts),
+        checkpoint_prefix: params.checkpoint.as_ref().and_then(|c| c.prefix.clone()),
         groups: groups.to_vec(),
         status: status.to_string(),
         agent_token: None,
@@ -1704,6 +1766,147 @@ mod tests {
             run_args(&["--input-zstd-window-log", "27"]).input_zstd_window_log,
             Some(27)
         );
+    }
+
+    /// A profile's `prefix` belongs to the profile's checkpoint section. Letting it apply
+    /// to a CLI `--checkpoint` too means a one-off scratch run under a training profile
+    /// aims at the shared ring — and since retention there is one checkpoint, its first
+    /// commit reclaims the real one. That is unrecoverable and silent, so the flag has to
+    /// be asked for.
+    #[test]
+    fn a_scratch_checkpoint_dir_does_not_inherit_the_profiles_shared_prefix() {
+        let profile = Profile {
+            gpu_classes: vec!["rtx 4090 (24 gb)".into()],
+            checkpoint: Some(crate::config::ProfileCheckpoint {
+                dir: "ckpts".into(),
+                interval_secs: 120,
+                quiesce_secs: 15,
+                prefix: Some("tinystories-77m".into()),
+            }),
+            ..Default::default()
+        };
+
+        // The profile's own checkpoint keeps the shared name.
+        let params = resolve_params(&bare_config(), Some(&profile), &run_args_no_class(&[]))
+            .expect("resolve params");
+        let ckpt = params.checkpoint.as_ref().expect("profile checkpoint");
+        assert_eq!(ckpt.dir, "ckpts");
+        assert_eq!(ckpt.prefix.as_deref(), Some("tinystories-77m"));
+
+        // Overriding the directory on the CLI drops it: this run writes to its own run
+        // prefix, where the worst it can destroy is its own checkpoint.
+        let params = resolve_params(
+            &bare_config(),
+            Some(&profile),
+            &run_args_no_class(&["--checkpoint", "/work/scratch"]),
+        )
+        .expect("resolve params");
+        let ckpt = params.checkpoint.as_ref().expect("cli checkpoint");
+        assert_eq!(ckpt.dir, "/work/scratch");
+        assert_eq!(
+            ckpt.prefix, None,
+            "a CLI --checkpoint must not silently aim at the profile's shared ring"
+        );
+
+        // Asking for both is still allowed — explicitly.
+        let params = resolve_params(
+            &bare_config(),
+            Some(&profile),
+            &run_args_no_class(&[
+                "--checkpoint",
+                "/work/scratch",
+                "--checkpoint-prefix",
+                "tinystories-77m",
+            ]),
+        )
+        .expect("resolve params");
+        assert_eq!(
+            params.checkpoint.as_ref().and_then(|c| c.prefix.as_deref()),
+            Some("tinystories-77m")
+        );
+
+        // A prefix with nothing to apply to is refused, not dropped: silently ignoring it
+        // would leave the operator believing the shared name is claimed and resumable
+        // while the run checkpoints nowhere.
+        let err = resolve_params(
+            &bare_config(),
+            None,
+            &run_args_no_class(&["--cpu-only", "--checkpoint-prefix", "tinystories-77m"]),
+        )
+        .err()
+        .expect("a prefix without a checkpoint must be refused");
+        assert!(
+            format!("{err:#}").contains("--checkpoint-prefix needs --checkpoint"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// Two runs rotating one slot ring overwrite each other's checkpoints, and nothing
+    /// reveals it until someone tries to resume. The guard is local-state only, so it is
+    /// pinned against a state directory this test owns.
+    #[test]
+    fn a_prefix_a_live_run_is_using_is_refused_until_that_run_ends() {
+        let _env = state::TEST_STATE_ENV.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: serialized by TEST_STATE_ENV against the other state-mutating tests
+        // (each is its own process under nextest, but not under plain `cargo test`);
+        // scopes state to the tempdir.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", dir.path());
+        }
+
+        let mut run = state::RunState {
+            v: state::STATE_VERSION,
+            run_id: "sf-live01".into(),
+            kind: "run".into(),
+            created_at: chrono::Utc::now(),
+            org: "org".into(),
+            project: "proj".into(),
+            profile: None,
+            image: None,
+            gpu_classes: vec![],
+            gpu_observed: None,
+            priority: None,
+            command: vec![],
+            output_names: None,
+            max_parts: None,
+            checkpoint_prefix: Some("tinystories-77m".into()),
+            groups: vec![],
+            status: "running".into(),
+            agent_token: None,
+            max_duration_secs: None,
+            result: None,
+        };
+        state::save_run(&run).unwrap();
+
+        // Through `resolve_params`, not the guard alone: the guard being correct is worth
+        // nothing if nothing calls it, and deleting the call site is the regression this
+        // has to catch.
+        let err = resolve_params(
+            &bare_config(),
+            None,
+            &run_args_no_class(&[
+                "--cpu-only",
+                "--checkpoint",
+                "ckpts",
+                "--checkpoint-prefix",
+                "tinystories-77m",
+            ]),
+        )
+        .err()
+        .expect("a live run already owns this prefix");
+        let text = format!("{err:#}");
+        assert!(text.contains("sf-live01"), "name the run: {text}");
+        assert!(
+            text.contains("sf-live01.json"),
+            "name the state file, since a crashed run's claim outlives it: {text}"
+        );
+
+        // A different name is unaffected, and so is the same one once the run is over.
+        ensure_prefix_unclaimed("something-else").expect("a free prefix");
+        run.status = "succeeded".into();
+        state::save_run(&run).unwrap();
+        ensure_prefix_unclaimed("tinystories-77m").expect("a finished run releases its prefix");
     }
 
     /// `--cpu-only` is a flag, so it beats a profile the way `--memory-gb` and
@@ -1946,6 +2149,7 @@ mod tests {
             command: vec![],
             output_names: None,
             max_parts: None,
+            checkpoint_prefix: None,
             groups: vec![GroupRef {
                 name: "sf-realloc".into(),
                 shard: 0,

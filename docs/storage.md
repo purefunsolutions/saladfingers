@@ -45,12 +45,31 @@ data.
 
 ## Checkpoints
 
-A run's checkpoint lives under `runs/<run-id>/<shard>/ckpt/`:
+By default a run's checkpoint lives under `runs/<run-id>/<shard>/ckpt/`, which means it is
+reaped together with the run. That is right for a one-shot job and wrong for training: a
+30k-step run that dies at step 21,000 has three quarters of the work in the bucket, and the
+next run's fresh id would leave it unreachable. `--checkpoint-prefix <name>` (or
+`prefix` under `[profiles.<name>.checkpoint]`) moves it to `ckpts/<name>/<shard>/` instead —
+a run-independent location that the next `--checkpoint-prefix <name>` run restores from
+automatically and that `gc` does not touch, since `gc` only reaps under `runs/`.
+
+```bash
+saladfingers run … --checkpoint /work/ckpts --checkpoint-prefix tinystories-77m …
+# a later run with the same prefix picks up where that one stopped
+saladfingers checkpoint show --prefix tinystories-77m
+```
+
+Only one run may hold a prefix at a time — two runs rotating one slot ring would overwrite
+each other's checkpoints — so `run` refuses a prefix a live local run already claims. That
+check reads local run state, so it catches the same-operator mistake, not a run launched
+from another machine.
+
+The layout is the same either way:
 
 ```
-ckpt/meta.json          the commit record — which slot is current, its step and sha256
-ckpt/slot0/data.tzst.*  ┐ the ring: one of these holds the current checkpoint,
-ckpt/slot1/data.tzst.*  ┘ the other is free for the next upload
+<base>/meta.json          the commit record — which slot is current, its step and sha256
+<base>/slot0/data.tzst.*  ┐ the ring: one of these holds the current checkpoint,
+<base>/slot1/data.tzst.*  ┘ the other is free for the next upload
 ```
 
 The agent **alternates** between the slots and rewrites `meta.json` only after the new
@@ -66,8 +85,9 @@ Because the live slot depends on how many times the run rotated, read the checkp
 the CLI rather than by guessing a key:
 
 ```bash
-saladfingers checkpoint show sf-x7k2mq            # step, size, age — no download
+saladfingers checkpoint show sf-x7k2mq                     # step, size, age — no download
 saladfingers checkpoint fetch sf-x7k2mq --dest ./ckpt
+saladfingers checkpoint fetch --prefix tinystories-77m     # the shared one
 ```
 
 `fetch` verifies the sha256 before extracting anything. It works after the run has ended and

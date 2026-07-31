@@ -12,8 +12,8 @@
 //! least interesting.
 //!
 //! The agent rotates checkpoints between the slots of a ring, so the current one lives at
-//! `ckpt/slot0/…` or `ckpt/slot1/…` depending on how many times it rotated. The metadata
-//! object is the index that resolves it, and these commands read it.
+//! `…/slot0/…` or `…/slot1/…` depending on how many times it rotated. The metadata object
+//! is the index that resolves it, and these commands read it.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -30,6 +30,85 @@ use crate::spec;
 /// Long enough to download a large checkpoint, short enough to stay a bounded credential.
 const EXPIRY: Duration = Duration::from_secs(6 * 3600);
 
+/// What a checkpoint command is pointed at: a run's own checkpoint, or a shared one.
+///
+/// The two are mutually exclusive and exactly one is required — clap enforces that with a
+/// required `ArgGroup`, and this type carries the same guarantee into the code, so no path
+/// has to invent behaviour for "neither" or "both". The pair of `Option`s it replaces had
+/// three unreachable arms, one of which would have produced the key `runs//0/ckpt`.
+#[derive(Debug, Clone)]
+pub enum Target {
+    /// The checkpoint stored inside a run, which `gc` reaps with the run.
+    Run(String),
+    /// A shared checkpoint, addressed by name and outliving every run that writes it.
+    Prefix(String),
+}
+
+impl Target {
+    /// Read the target out of parsed arguments, validating whichever name was given.
+    ///
+    /// # Errors
+    /// Returns an error if the name cannot be part of a storage key. Both names are
+    /// checked, not just the new one: the prefix by design, the run id because `fetch`
+    /// also builds a local path from it, where `..` would climb out of `sf-out/`.
+    pub fn from_args(args: &CheckpointArgs) -> Result<Self> {
+        match (&args.prefix, &args.run_id) {
+            (Some(prefix), _) => {
+                spec::validate_checkpoint_prefix(prefix)?;
+                Ok(Self::Prefix(prefix.clone()))
+            }
+            (None, Some(run_id)) => {
+                spec::validate_checkpoint_prefix(run_id)
+                    .with_context(|| format!("'{run_id}' is not a usable run id"))?;
+                Ok(Self::Run(run_id.clone()))
+            }
+            (None, None) => anyhow::bail!("pass a run id or --prefix NAME"),
+        }
+    }
+
+    /// The storage prefix holding this checkpoint's slots and metadata.
+    #[must_use]
+    pub fn base(&self, shard: u32) -> String {
+        match self {
+            Self::Run(run_id) => spec::checkpoint_base(run_id, shard, None),
+            Self::Prefix(name) => spec::checkpoint_base("", shard, Some(name)),
+        }
+    }
+
+    /// How to name this checkpoint in output.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Run(run_id) => format!("run {run_id}"),
+            Self::Prefix(name) => format!("prefix '{name}'"),
+        }
+    }
+
+    /// The label/value pair `show` prints, padded so the value sits in the same column
+    /// as the metadata fields below it.
+    fn show_heading(&self) -> String {
+        match self {
+            Self::Run(run_id) => format!("run          {run_id}"),
+            Self::Prefix(name) => format!("prefix       {name}"),
+        }
+    }
+}
+
+/// Where `fetch` extracts when `--dest` is not given.
+///
+/// `sf-out/<run-id-or-prefix>/<shard>/ckpt` — the `--help` text and docs promise exactly
+/// this shape, and nothing else pins it: swap the joins and every other test stays green
+/// while every scripted fetch lands somewhere new.
+fn default_dest(target: &Target, shard: u32) -> PathBuf {
+    let name = match target {
+        Target::Run(name) | Target::Prefix(name) => name,
+    };
+    PathBuf::from("sf-out")
+        .join(name)
+        .join(shard.to_string())
+        .join("ckpt")
+}
+
 /// Open the storage backend a checkpoint command reads through.
 fn backend_of(cfg: &Config) -> Result<(reqwest::Client, S3Backend)> {
     let storage = cfg
@@ -42,19 +121,20 @@ fn backend_of(cfg: &Config) -> Result<(reqwest::Client, S3Backend)> {
     ))
 }
 
-/// `saladfingers checkpoint show RUN_ID`
+/// `saladfingers checkpoint show RUN_ID` / `--prefix NAME`
 ///
 /// # Errors
-/// Returns an error when storage is unconfigured, unreachable, or holds no checkpoint for
-/// the run.
+/// Returns an error when storage is unconfigured, unreachable, or holds no checkpoint at
+/// the requested location.
 pub async fn show(cfg: Config, args: CheckpointArgs) -> Result<()> {
+    let target = Target::from_args(&args)?;
     let (http, backend) = backend_of(&cfg)?;
-    let meta = resolve(&http, &backend, &args.run_id, args.shard).await?;
+    let meta = resolve(&http, &backend, &target, args.shard).await?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&meta)?);
         return Ok(());
     }
-    println!("run          {} (shard {})", args.run_id, args.shard);
+    println!("{} (shard {})", target.show_heading(), args.shard);
     println!(
         "step         {}",
         meta.step
@@ -68,30 +148,18 @@ pub async fn show(cfg: Config, args: CheckpointArgs) -> Result<()> {
     Ok(())
 }
 
-/// `saladfingers checkpoint fetch RUN_ID [--dest DIR]`
+/// `saladfingers checkpoint fetch RUN_ID|--prefix NAME [--dest DIR]`
 ///
 /// # Errors
-/// Returns an error when storage is unconfigured, holds no checkpoint for the run, or the
-/// download fails its checksum.
+/// Returns an error when storage is unconfigured, holds no checkpoint at the requested
+/// location, or the download fails its checksum.
 pub async fn fetch(cfg: Config, args: CheckpointFetchArgs) -> Result<()> {
+    let target = Target::from_args(&args.target)?;
     let (http, backend) = backend_of(&cfg)?;
-    let dest = args.dest.map_or_else(
-        || {
-            PathBuf::from("sf-out")
-                .join(&args.target.run_id)
-                .join(args.target.shard.to_string())
-                .join("ckpt")
-        },
-        PathBuf::from,
-    );
-    let meta = fetch_into(
-        &http,
-        &backend,
-        &args.target.run_id,
-        args.target.shard,
-        &dest,
-    )
-    .await?;
+    let dest = args
+        .dest
+        .map_or_else(|| default_dest(&target, args.target.shard), PathBuf::from);
+    let meta = fetch_into(&http, &backend, &target, args.target.shard, &dest).await?;
     if args.target.json {
         println!(
             "{}",
@@ -106,7 +174,7 @@ pub async fn fetch(cfg: Config, args: CheckpointFetchArgs) -> Result<()> {
     Ok(())
 }
 
-/// Read the committed checkpoint metadata for a run's shard — the object that names the
+/// Read the committed checkpoint metadata for a target's shard — the object that names the
 /// live slot.
 ///
 /// Whatever decodes is returned: `show` displays a checkpoint's own account of itself,
@@ -114,15 +182,15 @@ pub async fn fetch(cfg: Config, args: CheckpointFetchArgs) -> Result<()> {
 /// Acting on the numbers is [`fetch_into`]'s job, and that is where they are bounded.
 ///
 /// # Errors
-/// Returns an error when storage holds no checkpoint for the run, the object cannot be
-/// read, or it was written by an agent speaking a different protocol version.
+/// Returns an error when storage holds no checkpoint there, the object cannot be read, or
+/// it was written by an agent speaking a different protocol version.
 pub async fn resolve(
     http: &reqwest::Client,
     backend: &S3Backend,
-    run_id: &str,
+    target: &Target,
     shard: u32,
 ) -> Result<CheckpointMeta> {
-    let key = spec::ckpt_meta_key(&spec::shard_prefix(run_id, shard));
+    let key = spec::ckpt_meta_key(&target.base(shard));
     // A fixed-size control document, so it takes the control deadline: without one, a
     // storage endpoint that accepts the connection and never answers hangs the command
     // with no output and no way to tell that apart from a slow download.
@@ -133,11 +201,14 @@ pub async fn resolve(
         .await
         .map_err(reqwest::Error::without_url)
         .context("fetching checkpoint metadata")?;
-    anyhow::ensure!(
-        resp.status().is_success(),
-        "no checkpoint for run '{run_id}' shard {shard} ({})",
-        resp.status()
-    );
+    if !resp.status().is_success() {
+        anyhow::bail!(
+            "no checkpoint for {} shard {shard} ({}){}",
+            target.describe(),
+            resp.status(),
+            prefix_hint(target)
+        );
+    }
     // The object is a few hundred bytes, and under a shared prefix its key is writable
     // by other runs — bound the body before buffering it, not after.
     anyhow::ensure!(
@@ -165,7 +236,26 @@ pub async fn resolve(
     serde_json::from_slice(&body).context("decoding checkpoint metadata")
 }
 
-/// Download the live slot of a run's checkpoint into `dest`, returning the metadata that
+/// When a run's own checkpoint is missing and local state records that the run wrote to a
+/// shared prefix, say so — the checkpoint is not gone, it is one flag away.
+///
+/// A hint appended to the error rather than a silent redirect: this reads local state, so
+/// the same command on another machine has to behave the same way, and a command that
+/// quietly addressed a different key depending on what is in `~/.local/state` would be
+/// worse than the error it replaced.
+fn prefix_hint(target: &Target) -> String {
+    let Target::Run(run_id) = target else {
+        return String::new();
+    };
+    match crate::state::load_run(run_id) {
+        Ok(Some(run)) => run.checkpoint_prefix.map_or_else(String::new, |prefix| {
+            format!(" — that run checkpointed to prefix '{prefix}'; use --prefix {prefix}")
+        }),
+        _ => String::new(),
+    }
+}
+
+/// Download the live slot of a checkpoint into `dest`, returning the metadata that
 /// described it.
 ///
 /// # Errors
@@ -174,11 +264,11 @@ pub async fn resolve(
 pub async fn fetch_into(
     http: &reqwest::Client,
     backend: &S3Backend,
-    run_id: &str,
+    target: &Target,
     shard: u32,
     dest: &Path,
 ) -> Result<CheckpointMeta> {
-    let meta = resolve(http, backend, run_id, shard).await?;
+    let meta = resolve(http, backend, target, shard).await?;
     anyhow::ensure!(meta.parts > 0, "checkpoint metadata records no data parts");
     // Every numeric field below comes from the node, which is untrusted (security.md,
     // Assumption 1). `parts` drives `(0..parts)` presigned-URL generation, so it is
@@ -212,7 +302,7 @@ pub async fn fetch_into(
         "checkpoint metadata records a malformed sha256 (not 64 hex characters)"
     );
 
-    let stem = spec::ckpt_slot_stem(&spec::shard_prefix(run_id, shard), meta.slot);
+    let stem = spec::ckpt_slot_stem(&target.base(shard), meta.slot);
     let get_urls: Vec<String> = (0..meta.parts)
         .map(|k| backend.presign_get(&transfer::part_key(&stem, k), EXPIRY))
         .collect();
@@ -254,17 +344,108 @@ mod tests {
     use super::*;
 
     /// The layout is wire-visible: the agent's URLs are signed for these keys at submit
-    /// time, and `fetch` re-derives them hours later. Pin the shared helper both sides
+    /// time, and `fetch` re-derives them hours later. Pin the shared helpers both sides
     /// call, so a change has to break this rather than silently 404 every fetch.
     #[test]
-    fn a_slots_key_is_per_slot_and_per_shard() {
-        let stem = |shard, slot| spec::ckpt_slot_stem(&spec::shard_prefix("sf-x", shard), slot);
-        assert_eq!(stem(0, 0), "runs/sf-x/0/ckpt/slot0/data");
-        assert_eq!(stem(3, 1), "runs/sf-x/3/ckpt/slot1/data");
+    fn a_run_scoped_checkpoint_lives_under_its_run() {
+        let target = Target::Run("sf-x".into());
+        assert_eq!(target.base(0), "runs/sf-x/0/ckpt");
         assert_eq!(
-            spec::ckpt_meta_key(&spec::shard_prefix("sf-x", 3)),
+            spec::ckpt_slot_stem(&target.base(3), 1),
+            "runs/sf-x/3/ckpt/slot1/data"
+        );
+        assert_eq!(
+            spec::ckpt_meta_key(&target.base(3)),
             "runs/sf-x/3/ckpt/meta.json"
         );
+    }
+
+    /// The whole point of a prefix: reachable from a *later* run, with a different id —
+    /// so the run id must not appear in the key at all.
+    #[test]
+    fn a_prefixed_checkpoint_is_addressed_without_any_run_id() {
+        let target = Target::Prefix("t77m".into());
+        assert_eq!(target.base(0), "ckpts/t77m/0");
+        assert_eq!(target.base(2), "ckpts/t77m/2");
+        assert_eq!(
+            spec::ckpt_meta_key(&target.base(2)),
+            "ckpts/t77m/2/meta.json"
+        );
+    }
+
+    /// `fetch`'s default `--dest` is built from the name, so `..` in a run id would climb
+    /// out of `sf-out/`. The prefix has always been validated; the run id reaches the same
+    /// two constructions and was not.
+    #[test]
+    fn a_name_that_would_escape_its_directory_is_refused() {
+        let args = |run_id: Option<&str>, prefix: Option<&str>| CheckpointArgs {
+            run_id: run_id.map(str::to_string),
+            prefix: prefix.map(str::to_string),
+            shard: 0,
+            json: false,
+        };
+        assert!(Target::from_args(&args(Some("../../etc"), None)).is_err());
+        assert!(Target::from_args(&args(None, Some("a/b"))).is_err());
+        assert!(Target::from_args(&args(Some("sf-x7k2mq"), None)).is_ok());
+        assert!(Target::from_args(&args(None, Some("tinystories-77m"))).is_ok());
+    }
+
+    /// The `--help` text and run.md promise this exact shape; nothing else pins it, and a
+    /// swapped join ships every scripted fetch into a different directory.
+    #[test]
+    fn the_default_dest_is_the_documented_shape() {
+        assert_eq!(
+            default_dest(&Target::Run("sf-x7k2mq".into()), 0),
+            PathBuf::from("sf-out/sf-x7k2mq/0/ckpt")
+        );
+        assert_eq!(
+            default_dest(&Target::Prefix("tinystories-77m".into()), 2),
+            PathBuf::from("sf-out/tinystories-77m/2/ckpt")
+        );
+    }
+
+    /// `Target::from_args` leans on clap's required `ArgGroup` to make "neither" and
+    /// "both" unreachable — and that group is declared on `CheckpointArgs` but consumed
+    /// through `#[command(flatten)]` by `fetch`, which is exactly the kind of plumbing a
+    /// clap upgrade or refactor can quietly loosen. If it does, `from_args` prefers
+    /// `--prefix` silently; these keep the loosening loud instead.
+    #[test]
+    fn a_checkpoint_target_is_exactly_one_of_run_id_and_prefix() {
+        use clap::Parser as _;
+        for argv in [
+            ["saladfingers", "checkpoint", "show"].as_slice(),
+            &[
+                "saladfingers",
+                "checkpoint",
+                "show",
+                "sf-x",
+                "--prefix",
+                "p",
+            ],
+            &["saladfingers", "checkpoint", "fetch"],
+            &[
+                "saladfingers",
+                "checkpoint",
+                "fetch",
+                "sf-x",
+                "--prefix",
+                "p",
+            ],
+        ] {
+            assert!(
+                crate::cli::Cli::try_parse_from(argv).is_err(),
+                "clap must refuse {argv:?}"
+            );
+        }
+        for argv in [
+            ["saladfingers", "checkpoint", "show", "sf-x"].as_slice(),
+            &["saladfingers", "checkpoint", "fetch", "--prefix", "p"],
+        ] {
+            assert!(
+                crate::cli::Cli::try_parse_from(argv).is_ok(),
+                "clap must accept {argv:?}"
+            );
+        }
     }
 
     #[test]

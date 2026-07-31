@@ -300,6 +300,11 @@ pub struct RunArgs {
     /// A checkpoint uploads once no file changed within this many seconds.
     #[arg(long, default_value_t = 15)]
     pub checkpoint_quiesce: u64,
+    /// Store the checkpoint under a shared name instead of inside this run, so a later
+    /// run with the same name resumes from it (e.g. `--checkpoint-prefix tinystories-77m`).
+    /// Without it the checkpoint is reaped together with the run that wrote it.
+    #[arg(long, value_name = "NAME")]
+    pub checkpoint_prefix: Option<String>,
     /// Create the groups and return immediately.
     #[arg(long)]
     pub detach: bool,
@@ -366,9 +371,14 @@ pub enum CheckpointCommand {
 }
 
 #[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("ckpt-target").required(true).args(["run_id", "prefix"])))]
 pub struct CheckpointArgs {
-    /// Run identifier (e.g. `sf-x7k2mq`).
-    pub run_id: String,
+    /// Run identifier (e.g. `sf-x7k2mq`) — reads the checkpoint stored inside that run.
+    pub run_id: Option<String>,
+    /// Shared checkpoint name, as passed to `run --checkpoint-prefix`. Reads the
+    /// run-independent checkpoint instead, which is the one that outlives its run.
+    #[arg(long, value_name = "NAME")]
+    pub prefix: Option<String>,
     /// Shard whose checkpoint to read.
     #[arg(long, default_value_t = 0)]
     pub shard: u32,
@@ -381,7 +391,7 @@ pub struct CheckpointArgs {
 pub struct CheckpointFetchArgs {
     #[command(flatten)]
     pub target: CheckpointArgs,
-    /// Directory to extract into. Defaults to `./sf-out/<run-id>/<shard>/ckpt`.
+    /// Directory to extract into. Defaults to `./sf-out/<run-id-or-prefix>/<shard>/ckpt`.
     #[arg(long)]
     pub dest: Option<String>,
 }

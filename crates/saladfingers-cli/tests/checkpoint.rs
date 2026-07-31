@@ -24,7 +24,7 @@ use axum::extract::{Path as AxPath, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::any;
-use saladfingers_cli::checkpoint::{fetch_into, resolve};
+use saladfingers_cli::checkpoint::{Target, fetch_into, resolve};
 use saladfingers_cli::presign::S3Backend;
 use saladfingers_cli::spec;
 use saladfingers_protocol::job::CheckpointMeta;
@@ -82,17 +82,23 @@ fn ckpt_dir(step: u64, payload: &[u8]) -> tempfile::TempDir {
     dir
 }
 
+/// The run whose own checkpoint most tests read.
+fn run_target() -> Target {
+    Target::Run(RUN.into())
+}
+
 /// Upload `dir` into `slot` the way the agent does — through presigned PUTs, over the
 /// shared key helper — and return the metadata that commits it.
 async fn upload_slot(
     http: &reqwest::Client,
     backend: &S3Backend,
+    target: &Target,
     shard: u32,
     slot: u32,
     dir: &Path,
     step: u64,
 ) -> CheckpointMeta {
-    let stem = spec::ckpt_slot_stem(&spec::shard_prefix(RUN, shard), slot);
+    let stem = spec::ckpt_slot_stem(&target.base(shard), slot);
     let put_urls: Vec<String> = (0..4)
         .map(|k| backend.presign_put(&transfer::part_key(&stem, k), EXPIRY))
         .collect();
@@ -110,9 +116,9 @@ async fn upload_slot(
     }
 }
 
-/// Commit `meta` as the shard's checkpoint metadata.
-fn commit(store: &Store, shard: u32, meta: &serde_json::Value) {
-    let key = spec::ckpt_meta_key(&spec::shard_prefix(RUN, shard));
+/// Commit `meta` as the target's checkpoint metadata for `shard`.
+fn commit(store: &Store, target: &Target, shard: u32, meta: &serde_json::Value) {
+    let key = spec::ckpt_meta_key(&target.base(shard));
     store
         .lock()
         .unwrap()
@@ -126,14 +132,59 @@ async fn resolve_returns_the_metadata_the_agent_committed() {
     let http = reqwest::Client::new();
 
     let src = ckpt_dir(21_000, &[4u8; 8192]);
-    let meta = upload_slot(&http, &backend, 0, 1, src.path(), 21_000).await;
-    commit(&store, 0, &serde_json::to_value(&meta).unwrap());
+    let meta = upload_slot(&http, &backend, &run_target(), 0, 1, src.path(), 21_000).await;
+    commit(
+        &store,
+        &run_target(),
+        0,
+        &serde_json::to_value(&meta).unwrap(),
+    );
 
-    let got = resolve(&http, &backend, RUN, 0).await.expect("resolve");
+    let got = resolve(&http, &backend, &run_target(), 0)
+        .await
+        .expect("resolve");
     assert_eq!(got.step, Some(21_000));
     assert_eq!(got.slot, 1);
     assert_eq!(got.sha256, meta.sha256);
     assert_eq!(got.parts, meta.parts);
+}
+
+/// The point of a prefix is that a *later* run, with an id nobody has generated yet, can
+/// read what this one wrote. So the whole round trip has to work with the run id absent
+/// from every key: the writer's keys, the metadata object, and the reader's re-derivation.
+#[tokio::test]
+async fn a_prefixed_checkpoint_round_trips_without_any_run_id() {
+    let (base, store) = storage().await;
+    let backend = backend(&base);
+    let http = reqwest::Client::new();
+    let target = Target::Prefix("tinystories-77m".into());
+
+    let src = ckpt_dir(21_000, &[6u8; 8192]);
+    let meta = upload_slot(&http, &backend, &target, 2, 0, src.path(), 21_000).await;
+    commit(&store, &target, 2, &serde_json::to_value(&meta).unwrap());
+
+    // Every key is under the shared namespace, and none of them mentions the run.
+    let keys: Vec<String> = store.lock().unwrap().keys().cloned().collect();
+    assert!(
+        keys.iter()
+            .all(|k| k.starts_with("ckpts/tinystories-77m/2/") && !k.contains(RUN)),
+        "a prefixed checkpoint must not be stored under any run: {keys:?}"
+    );
+
+    let dest = tempfile::tempdir().unwrap();
+    fetch_into(&http, &backend, &target, 2, dest.path())
+        .await
+        .expect("a later run reads the shared checkpoint");
+    assert_eq!(
+        std::fs::read(dest.path().join("step_00021000/weights.bin")).unwrap(),
+        vec![6u8; 8192]
+    );
+
+    // Shards do not collide: each gets its own ring under the same name.
+    assert!(
+        resolve(&http, &backend, &target, 0).await.is_err(),
+        "shard 0 has its own ring and holds nothing yet"
+    );
 }
 
 /// The failure an operator actually hits — a run that never checkpointed, or a `gc` that
@@ -144,12 +195,12 @@ async fn a_missing_checkpoint_is_named_rather_than_rendered_as_a_status_line() {
     let (base, _store) = storage().await;
     let http = reqwest::Client::new();
 
-    let err = resolve(&http, &backend(&base), RUN, 3)
+    let err = resolve(&http, &backend(&base), &run_target(), 3)
         .await
         .expect_err("an empty store holds no checkpoint");
     let text = format!("{err:#}");
     assert!(
-        text.contains("no checkpoint for run 'sf-x7k2mq' shard 3"),
+        text.contains("no checkpoint for run sf-x7k2mq shard 3"),
         "unexpected error: {text}"
     );
     assert!(
@@ -168,6 +219,7 @@ async fn v1_metadata_reports_a_version_mismatch_not_a_missing_field() {
 
     commit(
         &store,
+        &run_target(),
         0,
         &serde_json::json!({
             "v": 1, "parts": 1, "bytes": 8192,
@@ -175,7 +227,7 @@ async fn v1_metadata_reports_a_version_mismatch_not_a_missing_field() {
         }),
     );
 
-    let err = resolve(&http, &backend(&base), RUN, 0)
+    let err = resolve(&http, &backend(&base), &run_target(), 0)
         .await
         .expect_err("a v1 checkpoint is not readable by this CLI");
     let text = format!("{err:#}");
@@ -200,13 +252,18 @@ async fn fetch_downloads_the_slot_the_metadata_names_byte_for_byte() {
     let http = reqwest::Client::new();
 
     let old = ckpt_dir(10_000, &[1u8; 8192]);
-    upload_slot(&http, &backend, 0, 0, old.path(), 10_000).await;
+    upload_slot(&http, &backend, &run_target(), 0, 0, old.path(), 10_000).await;
     let new = ckpt_dir(21_000, &[2u8; 8192]);
-    let meta = upload_slot(&http, &backend, 0, 1, new.path(), 21_000).await;
-    commit(&store, 0, &serde_json::to_value(&meta).unwrap());
+    let meta = upload_slot(&http, &backend, &run_target(), 0, 1, new.path(), 21_000).await;
+    commit(
+        &store,
+        &run_target(),
+        0,
+        &serde_json::to_value(&meta).unwrap(),
+    );
 
     let dest = tempfile::tempdir().unwrap();
-    let got = fetch_into(&http, &backend, RUN, 0, dest.path())
+    let got = fetch_into(&http, &backend, &run_target(), 0, dest.path())
         .await
         .expect("fetch");
     assert_eq!(got.slot, 1);
@@ -231,12 +288,17 @@ async fn fetch_fails_the_checksum_before_extracting_anything() {
     let http = reqwest::Client::new();
 
     let src = ckpt_dir(21_000, &[5u8; 8192]);
-    let mut meta = upload_slot(&http, &backend, 0, 0, src.path(), 21_000).await;
+    let mut meta = upload_slot(&http, &backend, &run_target(), 0, 0, src.path(), 21_000).await;
     meta.sha256 = "1".repeat(64);
-    commit(&store, 0, &serde_json::to_value(&meta).unwrap());
+    commit(
+        &store,
+        &run_target(),
+        0,
+        &serde_json::to_value(&meta).unwrap(),
+    );
 
     let dest = tempfile::tempdir().unwrap();
-    let err = fetch_into(&http, &backend, RUN, 0, dest.path())
+    let err = fetch_into(&http, &backend, &run_target(), 0, dest.path())
         .await
         .expect_err("a checksum mismatch must fail the fetch");
     assert!(
@@ -261,6 +323,7 @@ async fn a_parts_count_past_the_protocol_cap_is_refused_before_any_url_is_signed
 
     commit(
         &store,
+        &run_target(),
         0,
         &serde_json::json!({
             "v": PROTOCOL_VERSION,
@@ -273,7 +336,7 @@ async fn a_parts_count_past_the_protocol_cap_is_refused_before_any_url_is_signed
     );
 
     let dest = tempfile::tempdir().unwrap();
-    let err = fetch_into(&http, &backend(&base), RUN, 0, dest.path())
+    let err = fetch_into(&http, &backend(&base), &run_target(), 0, dest.path())
         .await
         .expect_err("an absurd part count must be refused");
     let text = format!("{err:#}");
@@ -284,7 +347,7 @@ async fn a_parts_count_past_the_protocol_cap_is_refused_before_any_url_is_signed
 
     // `show` is deliberately not bounded the same way: reading a broken checkpoint's own
     // account of itself is how an operator diagnoses it, and it signs nothing per part.
-    resolve(&http, &backend(&base), RUN, 0)
+    resolve(&http, &backend(&base), &run_target(), 0)
         .await
         .expect("show must still display a checkpoint that fetch refuses");
 }
@@ -302,13 +365,14 @@ async fn malformed_slot_or_checksum_is_named_at_the_metadata_not_downstream() {
 
     commit(
         &store,
+        &run_target(),
         0,
         &serde_json::json!({
             "v": PROTOCOL_VERSION, "slot": 7, "parts": 1, "bytes": 8192,
             "sha256": "0".repeat(64), "uploaded_at": "2026-07-01T00:00:00Z",
         }),
     );
-    let err = fetch_into(&http, &backend(&base), RUN, 0, dest.path())
+    let err = fetch_into(&http, &backend(&base), &run_target(), 0, dest.path())
         .await
         .expect_err("an out-of-ring slot must be refused");
     assert!(
@@ -318,13 +382,14 @@ async fn malformed_slot_or_checksum_is_named_at_the_metadata_not_downstream() {
 
     commit(
         &store,
+        &run_target(),
         0,
         &serde_json::json!({
             "v": PROTOCOL_VERSION, "slot": 0, "parts": 1, "bytes": 8192,
             "sha256": "not-a-checksum", "uploaded_at": "2026-07-01T00:00:00Z",
         }),
     );
-    let err = fetch_into(&http, &backend(&base), RUN, 0, dest.path())
+    let err = fetch_into(&http, &backend(&base), &run_target(), 0, dest.path())
         .await
         .expect_err("a malformed checksum must be refused");
     assert!(

@@ -133,6 +133,7 @@ pub async fn create(cfg: Config, args: SessionCreateArgs) -> Result<()> {
         command: vec![],
         output_names: None,
         max_parts: None,
+        checkpoint_prefix: None,
         groups: vec![state::GroupRef {
             name: name.clone(),
             shard: 0,
@@ -960,6 +961,7 @@ mod tests {
             command: vec![],
             output_names: None,
             max_parts: None,
+            checkpoint_prefix: None,
             groups: vec![],
             status: "running".into(),
             agent_token: None,

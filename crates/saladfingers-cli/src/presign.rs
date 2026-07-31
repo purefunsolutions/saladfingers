@@ -252,6 +252,7 @@ mod tests {
                 dir: "ckpt".into(),
                 interval_secs: 30,
                 quiesce_secs: 15,
+                prefix: None,
             }),
             expiry: Duration::from_secs(300),
         });

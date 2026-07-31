@@ -114,6 +114,7 @@ pub async fn up(cfg: Config, args: ServeUpArgs) -> Result<()> {
         command: args.command.clone(),
         output_names: None,
         max_parts: None,
+        checkpoint_prefix: None,
         groups: vec![state::GroupRef {
             name: name.clone(),
             shard: 0,
