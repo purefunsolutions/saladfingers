@@ -1957,6 +1957,7 @@ dependencies = [
  "chrono",
  "clap",
  "comfy-table",
+ "futures-util",
  "getrandom 0.4.3",
  "humantime",
  "reqwest",

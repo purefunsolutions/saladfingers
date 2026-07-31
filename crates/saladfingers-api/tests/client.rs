@@ -241,6 +241,43 @@ async fn group_status_parses_known_and_unknown_states() {
 }
 
 #[tokio::test]
+async fn a_gateway_group_yields_a_public_https_url() {
+    // `run --expose-port` reports this URL to the user, so the shape of the
+    // response the CLI reads from is worth pinning: `networking.dns` is a bare
+    // hostname and the caller must get a scheme in front of it.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("{}/exposed", containers_path())))
+        .respond_with(json_response(
+            200,
+            r#"{
+              "id": "cg-123",
+              "name": "exposed",
+              "current_state": {"status": "running"},
+              "networking": {"dns": "curious-salad-a1b2c3.salad.cloud"}
+            }"#,
+        ))
+        .mount(&server)
+        .await;
+    // No networking block at all — every run without --expose-port.
+    Mock::given(method("GET"))
+        .and(path(format!("{}/plain", containers_path())))
+        .respond_with(json_response(200, GROUP_RUNNING_JSON))
+        .mount(&server)
+        .await;
+
+    let client = fast_client(server.uri());
+    let exposed = client.get_container_group("exposed").await.unwrap();
+    assert_eq!(
+        exposed.gateway_url().as_deref(),
+        Some("https://curious-salad-a1b2c3.salad.cloud")
+    );
+
+    let plain = client.get_container_group("plain").await.unwrap();
+    assert!(plain.gateway_url().is_none());
+}
+
+#[tokio::test]
 async fn instances_parse_pulling_progress() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

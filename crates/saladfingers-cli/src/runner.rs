@@ -54,6 +54,9 @@ struct RunParams {
     gate: Option<GateParams>,
     checkpoint: Option<CheckpointParams>,
     name_hint: Option<String>,
+    /// Container port to publish through the gateway, or `None` for no gateway
+    /// — the default, and what every run did before `--expose-port` existed.
+    expose_port: Option<u16>,
 }
 
 /// `saladfingers run`
@@ -153,23 +156,14 @@ pub async fn run(cfg: Config, args: RunArgs) -> Result<()> {
 
         let env = job_env(&job_url, &run_id, shard, shard_count, job_sha256)?;
 
-        let request = deploy::build_request(GroupParams {
-            name: name.clone(),
-            image: params.image.clone(),
-            gpu_uuids: uuids.clone(),
+        let request = deploy::build_request(shard_group_params(
+            &cfg,
+            &params,
+            name.clone(),
+            uuids.clone(),
             priority,
-            cpu: params.cpu,
-            memory_mb: params.memory_mb,
-            disk_gib: params.disk_gib,
-            command: Some(vec!["/bin/sf-agent".into(), "run".into()]),
             env,
-            gateway_port: None,
-            gateway_auth: false,
-            registry_auth: deploy::registry_auth(&cfg),
-            restart_policy: RestartPolicy::OnFailure,
-            country_codes: params.country_codes.clone(),
-            shm_mb: params.shm_mb,
-        });
+        ));
         eprintln!("run {run_id}: creating shard {shard} ({name})...");
         if let Err(e) = client.create_container_group(&request).await {
             // A mid-loop failure must not leak the shards already created — each is a
@@ -193,6 +187,10 @@ pub async fn run(cfg: Config, args: RunArgs) -> Result<()> {
             machine_history: Vec::new(),
             running_spans: Vec::new(),
         });
+    }
+
+    if params.expose_port.is_some() {
+        report_gateways(&client, &run_id, &groups).await;
     }
 
     save_state(&cfg, &run_id, &params, &groups, "running");
@@ -848,6 +846,69 @@ fn running_machine_id(instances: &[Instance]) -> Option<String> {
         .and_then(|i| i.machine_id.clone())
 }
 
+/// How long to wait for the control plane to publish a group's gateway DNS
+/// name. It is static per group and normally present on the create response,
+/// but it has been observed a poll or two late, and a URL printed after the
+/// scrolling status lines is a URL nobody sees.
+const GATEWAY_TRIES: u32 = 5;
+const GATEWAY_RETRY: Duration = Duration::from_secs(3);
+
+/// Print the public gateway URL of every group in the run.
+///
+/// Best-effort by construction: the groups are already created and billing, so
+/// a control-plane hiccup here must never fail the run — the worst outcome is
+/// a run that trains fine without a clickable link.
+async fn report_gateways(client: &SaladClient, run_id: &str, groups: &[GroupRef]) {
+    for g in groups {
+        let mut url = None;
+        for attempt in 0..GATEWAY_TRIES {
+            match client.get_container_group(&g.name).await {
+                Ok(group) => {
+                    if let Some(u) = group.gateway_url() {
+                        url = Some(u);
+                        break;
+                    }
+                }
+                Err(e) => tracing::warn!("gateway lookup for {} failed: {e:#}", g.name),
+            }
+            if attempt + 1 < GATEWAY_TRIES {
+                tokio::time::sleep(GATEWAY_RETRY).await;
+            }
+        }
+        match url {
+            Some(u) => eprintln!("{}", watch_hint(run_id, g.shard, &u)),
+            None => eprintln!(
+                "run {run_id}: shard {} requested a gateway but no URL is published yet; \
+                 re-check with `saladfingers status {run_id}`",
+                g.shard
+            ),
+        }
+    }
+}
+
+/// What to tell the operator about an exposed shard.
+///
+/// Deliberately NOT "open this URL": the gateway is authenticated, so pasting it into a
+/// browser returns 401. Print the command that actually works, and the loopback URL that
+/// command will serve on — from [`tunnel::browser_url`] and the same default the
+/// `--local-port` flag carries, so the advice cannot drift from the tool. Also say it
+/// answers only once the instance is up: the image still has to pull, and a 503 on the
+/// first try reads as a broken feature.
+fn watch_hint(run_id: &str, shard: u32, url: &str) -> String {
+    let shard_flag = if shard == 0 {
+        String::new()
+    } else {
+        format!(" --shard {shard}")
+    };
+    format!(
+        "run {run_id}: shard {shard} exposed at {url} (authenticated — a browser gets 401)\n  \
+         watch it with:  saladfingers tunnel {run_id}{shard_flag}\n  \
+         then open {}\n  \
+         (serves once the instance reaches `running`; 503 until then)",
+        crate::tunnel::browser_url(crate::cli::DEFAULT_TUNNEL_PORT)
+    )
+}
+
 async fn await_shard(
     client: &SaladClient,
     http: &reqwest::Client,
@@ -1206,6 +1267,50 @@ fn memory_mb(gib: Option<u32>) -> Result<u32> {
     })
 }
 
+/// The group request for one shard.
+///
+/// Extracted from `run`'s create loop so `gateway_auth` is reachable from a test. The
+/// value is a security decision, not a parameter: `run --expose-port` publishes a port
+/// on a machine someone else owns, and `auth=false` there would put a live training
+/// dashboard in front of anyone who learns the DNS name.
+fn shard_group_params(
+    cfg: &Config,
+    params: &RunParams,
+    name: String,
+    gpu_uuids: Vec<String>,
+    priority: saladfingers_api::ContainerPriority,
+    env: BTreeMap<String, String>,
+) -> GroupParams {
+    GroupParams {
+        name,
+        image: params.image.clone(),
+        gpu_uuids,
+        priority,
+        cpu: params.cpu,
+        memory_mb: params.memory_mb,
+        disk_gib: params.disk_gib,
+        command: Some(vec!["/bin/sf-agent".into(), "run".into()]),
+        env,
+        gateway_port: params.expose_port,
+        // AUTHENTICATED, so the exposed port is never reachable from the
+        // public internet: unauthenticated traffic is rejected at the
+        // Cloudflare edge and never reaches the container at all.
+        //
+        // A browser cannot attach `Salad-Api-Key` to a navigation, so the
+        // caller runs `saladfingers tunnel`, a loopback proxy that injects
+        // it, and points the browser at 127.0.0.1. Same trust model as
+        // `session`/`probe`; the key never leaves the caller's host.
+        //
+        // `auth=false` would save the tunnel and publish a live training
+        // dashboard to anyone who learns the DNS name.
+        gateway_auth: true,
+        registry_auth: deploy::registry_auth(cfg),
+        restart_policy: RestartPolicy::OnFailure,
+        country_codes: params.country_codes.clone(),
+        shm_mb: params.shm_mb,
+    }
+}
+
 fn resolve_params(cfg: &Config, profile: Option<&Profile>, args: &RunArgs) -> Result<RunParams> {
     let image = crate::image::resolve_deploy_image(
         args.image.as_deref(),
@@ -1333,6 +1438,7 @@ fn resolve_params(cfg: &Config, profile: Option<&Profile>, args: &RunArgs) -> Re
         gate,
         checkpoint,
         name_hint: args.name_hint.clone(),
+        expose_port: args.expose_port,
     })
 }
 
@@ -1568,6 +1674,66 @@ mod tests {
             run_args(&["--input-zstd-window-log", "27"]).input_zstd_window_log,
             Some(27)
         );
+    }
+
+    /// The security invariant of `--expose-port`, end to end: the flag, through
+    /// `resolve_params` and the group request, to the JSON that reaches SaladCloud.
+    ///
+    /// `auth=false` here would publish a live training dashboard — on a machine someone
+    /// else owns — to anyone who learns the DNS name, and no other test in the suite
+    /// would notice: `deploy`'s gateway tests build their own `GroupParams` and prove
+    /// only that whatever `run` chooses is serialized faithfully.
+    #[test]
+    fn an_exposed_port_is_always_an_authenticated_gateway() {
+        let cfg = bare_config();
+        let params = resolve_params(&cfg, None, &run_args(&["--expose-port", "8080"]))
+            .expect("resolve params");
+        let gp = shard_group_params(
+            &cfg,
+            &params,
+            "sf-x7k2mq".into(),
+            vec!["uuid-1".into()],
+            saladfingers_api::ContainerPriority::Batch,
+            BTreeMap::new(),
+        );
+        assert_eq!(gp.gateway_port, Some(8080));
+        let body = serde_json::to_value(deploy::build_request(gp)).expect("serialize");
+        assert_eq!(body["networking"]["port"], 8080);
+        assert_eq!(
+            body["networking"]["auth"], true,
+            "run must never create a public gateway: {body}"
+        );
+
+        // And a run without the flag asks for no gateway at all.
+        let plain = resolve_params(&cfg, None, &run_args(&[])).expect("resolve params");
+        assert_eq!(
+            shard_group_params(
+                &cfg,
+                &plain,
+                "sf-x7k2mq".into(),
+                vec![],
+                saladfingers_api::ContainerPriority::Batch,
+                BTreeMap::new(),
+            )
+            .gateway_port,
+            None
+        );
+    }
+
+    /// The hint `run` prints and the port `tunnel` binds are one constant, so the
+    /// instruction cannot send an operator to a port nothing is listening on.
+    #[test]
+    fn the_watch_hint_points_at_the_port_the_tunnel_actually_binds() {
+        let hint = watch_hint("sf-x7k2mq", 0, "https://curious-salad.salad.cloud");
+        assert!(
+            hint.contains(&crate::tunnel::browser_url(crate::cli::DEFAULT_TUNNEL_PORT)),
+            "{hint}"
+        );
+        assert!(
+            !hint.contains("--shard"),
+            "shard 0 is the default and needs no flag: {hint}"
+        );
+        assert!(watch_hint("sf-x7k2mq", 2, "https://x").contains("--shard 2"));
     }
 
     /// Past clap, the tunables are stored unvalidated and the read side silently

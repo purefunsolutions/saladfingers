@@ -513,4 +513,60 @@ mod tests {
             Some("tok".to_string()),
         );
     }
+
+    fn group_params(gateway_port: Option<u16>) -> GroupParams {
+        GroupParams {
+            name: "sf-abc-0".into(),
+            image: "docker.io/library/ubuntu:24.04".into(),
+            gpu_uuids: vec!["uuid-1".into()],
+            priority: ContainerPriority::Batch,
+            cpu: 8,
+            memory_mb: 16384,
+            disk_gib: 25,
+            command: None,
+            env: BTreeMap::new(),
+            gateway_port,
+            gateway_auth: false,
+            registry_auth: None,
+            restart_policy: RestartPolicy::OnFailure,
+            country_codes: Vec::new(),
+            shm_mb: None,
+        }
+    }
+
+    #[test]
+    fn no_gateway_port_means_no_networking_block_at_all() {
+        // The pre-`--expose-port` behaviour of every batch run: the field must
+        // be absent from the JSON, not present-and-null.
+        let req = build_request(group_params(None));
+        assert!(req.networking.is_none());
+        let body = serde_json::to_value(&req).unwrap();
+        assert!(
+            body.get("networking").is_none(),
+            "an unexposed run must not send a networking block: {body}"
+        );
+    }
+
+    #[test]
+    fn an_exposed_port_becomes_an_http_gateway_carrying_the_requested_auth() {
+        // `auth` is a pass-through, and BOTH polarities are load-bearing:
+        // `serve` needs false (its end users hold no Salad key), while `run`
+        // and `session` need true (nothing reaches the container without one).
+        // Asserting only one lets a change flip the other silently — and for
+        // `run` that change publishes a live training dashboard to the
+        // internet, which is not a failure any test would otherwise catch.
+        for auth in [false, true] {
+            let mut p = group_params(Some(7777));
+            p.gateway_auth = auth;
+            let req = build_request(p);
+            let net = req.networking.as_ref().expect("networking block");
+            assert_eq!(net.port, 7777);
+            // Only "http" is accepted by the API.
+            assert_eq!(net.protocol, "http");
+            assert_eq!(net.auth, auth);
+            let body = serde_json::to_value(&req).unwrap();
+            assert_eq!(body["networking"]["port"], 7777);
+            assert_eq!(body["networking"]["auth"], auth);
+        }
+    }
 }

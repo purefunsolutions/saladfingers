@@ -43,10 +43,14 @@ base64 = { workspace = true }
 sha2 = { workspace = true }
 # `image push` writes the registry authfile + digestfile to a private temp dir.
 tempfile = { workspace = true }
+# `tunnel` runs a loopback reverse proxy onto an authenticated gateway. Both
+# are already in the workspace — the agent's own in-container proxy uses them —
+# so this adds no new third-party surface, only a new edge of the existing one.
+axum = { workspace = true }
+futures-util = { workspace = true }
 
 [dev-dependencies]
 wiremock = { workspace = true }
-axum = { workspace = true }
 tokio = { workspace = true, features = [
   "rt-multi-thread",
   "macros",
