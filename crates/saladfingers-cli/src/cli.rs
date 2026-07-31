@@ -176,6 +176,23 @@ pub struct CostEstimateArgs {
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
+    /// zstd level for compressing `--input` uploads (1–22)
+    /// [default: $SALADFINGERS_ZSTD_LEVEL, else 19].
+    ///
+    /// 19 rather than the library's 3 because staged inputs are the one
+    /// payload worth compressing hard: a tokenized corpus goes 472 → 311 MiB,
+    /// which on a slow uplink is ~13 minutes saved for ~3 of CPU. Applies only
+    /// to what THIS process uploads — the agent compresses checkpoints on the
+    /// node at the library default (unless the image itself sets
+    /// SALADFINGERS_ZSTD_LEVEL), where f32 weights make a higher level pure
+    /// waste (measured: byte-identical output for 39 s of extra CPU).
+    #[arg(long, value_parser = clap::value_parser!(i32).range(1..=22))]
+    pub input_zstd_level: Option<i32>,
+    /// zstd window log for `--input` uploads (10–31 = 1 KiB–2 GiB), which also
+    /// enables long-distance matching. Unset uses libzstd's per-level window.
+    /// Worth ~2% on pre-tokenized ids; more on raw text.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(10..=31))]
+    pub input_zstd_window_log: Option<u32>,
     /// Profile name from the project config.
     #[arg(long)]
     pub profile: Option<String>,

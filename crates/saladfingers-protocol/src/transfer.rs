@@ -14,6 +14,7 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -42,6 +43,186 @@ pub const MAX_DECOMPRESS_RATIO: u64 = 100;
 /// would itself be tiny — is always allowed to expand to at least this much, so a legitimate
 /// small output is never mistaken for a bomb (1 GiB comfortably covers any real small output).
 pub const MIN_DECOMPRESS_LIMIT: u64 = 1024 * 1024 * 1024;
+
+/// Environment knob for the outgoing zstd level, read at each compress call.
+const ZSTD_LEVEL_ENV: &str = "SALADFINGERS_ZSTD_LEVEL";
+/// Environment knob for the outgoing zstd window log.
+const ZSTD_WINDOW_LOG_ENV: &str = "SALADFINGERS_ZSTD_WINDOW_LOG";
+
+/// zstd level for outgoing artifacts. Overridable with `SALADFINGERS_ZSTD_LEVEL`
+/// (1–22 — this is real libzstd through the `zstd` crate, so the whole range is
+/// live, unlike the pure-Go implementation skopeo uses for image layers, whose
+/// level knob quantizes to four tiers). The variable is read by whichever
+/// process is compressing: tuning the agent's node-side uploads means an
+/// image-level `ENV`, because `run --env` never reaches the agent's own
+/// environment — it is applied only to the training command.
+///
+/// Default 3, because of what this engine actually carries.
+///
+/// What flows through here depends on the caller. The agent's uploads —
+/// checkpoints and output weights — are f32 and effectively incompressible,
+/// and they are compressed on a rented node mid-training, so the default stays
+/// low. Datasets, the one genuinely compressible payload, reach the node either
+/// baked into the image as a layer (never touching this path) or staged per run
+/// with `run --input`, where the CLI raises the level for its own process via
+/// [`set_compression`]. Measured on a real 294 MiB `model.safetensors`:
+///
+/// | level | size            | time |
+/// |-------|-----------------|------|
+/// | 3     | 271 MiB (92.6%) |  0 s |
+/// | 19    | 271 MiB (92.6%) | 39 s |
+///
+/// Byte-for-byte the same output for 39 s of extra CPU — and that CPU is spent
+/// on a rented node in the middle of training, once per checkpoint.
+///
+/// For a compressible upload, raise it: on the 941 MiB tokenized corpus level 3
+/// emits 472 MiB and level 19 emits 311 MiB (200 s), which on a 220 KiB/s
+/// uplink is 37 minutes against 24. Level 22 reaches 283 MiB but takes 720 s —
+/// nearly 4× the CPU for ~3 more minutes saved, so 19 is where the curve
+/// flattens.
+fn zstd_level() -> i32 {
+    zstd_level_from(ZSTD_LEVEL_OVERRIDE.load(Ordering::Relaxed), &real_env)
+}
+
+/// Pure form of [`zstd_level`]: `override_raw` is the loaded override cell and
+/// `env` the environment lookup (real env in production, a fake map in tests) —
+/// the same seam the CLI's skopeo compression flags use.
+fn zstd_level_from(override_raw: i32, env: &impl Fn(&str) -> Option<String>) -> i32 {
+    compression_override(override_raw, 1..=22)
+        .or_else(|| env_zstd_level_from(env))
+        .unwrap_or(3)
+}
+
+/// The validated `SALADFINGERS_ZSTD_LEVEL`, if set, parseable and in 1–22.
+/// Values are trimmed first (a padded `" 19 "` counts); anything else is
+/// ignored rather than clamped.
+fn env_zstd_level_from(env: &impl Fn(&str) -> Option<String>) -> Option<i32> {
+    env(ZSTD_LEVEL_ENV)
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .filter(|l| (1..=22).contains(l))
+}
+
+/// The validated `SALADFINGERS_ZSTD_LEVEL` from the real environment — for the
+/// one caller that must weigh it against a flag BEFORE [`set_compression`]
+/// stores the winner (`run --input-zstd-level`).
+pub fn env_zstd_level() -> Option<i32> {
+    env_zstd_level_from(&real_env)
+}
+
+/// Process-wide compression overrides, set by [`set_compression`].
+///
+/// `i32::MIN` means "unset" so that any legal value stays expressible.
+static ZSTD_LEVEL_OVERRIDE: AtomicI32 = AtomicI32::new(i32::MIN);
+static ZSTD_WINDOW_LOG_OVERRIDE: AtomicI32 = AtomicI32::new(i32::MIN);
+
+/// The valid subrange of a loaded override cell, or `None` for the sentinel and
+/// for out-of-range stores — [`set_compression`] stores unvalidated; validity
+/// is judged at each read.
+fn compression_override(raw: i32, valid: std::ops::RangeInclusive<i32>) -> Option<i32> {
+    (raw != i32::MIN && valid.contains(&raw)).then_some(raw)
+}
+
+/// Raise compression for this process only.
+///
+/// Scoped rather than global on purpose. The two ends upload very different
+/// things: the CLI sends **inputs** (datasets — compressible), while the agent
+/// on the rented node sends **checkpoints and weights** (f32 — not). Because
+/// those are separate processes, the CLI can turn this up for its uploads with
+/// no risk of the setting reaching the node's checkpoint path, where it would
+/// only burn training CPU. See the tables on [`zstd_level`].
+pub fn set_compression(level: Option<i32>, window_log: Option<u32>) {
+    if let Some(l) = level {
+        ZSTD_LEVEL_OVERRIDE.store(l, Ordering::Relaxed);
+    }
+    if let Some(w) = window_log {
+        ZSTD_WINDOW_LOG_OVERRIDE.store(w as i32, Ordering::Relaxed);
+    }
+}
+
+/// Window log for outgoing artifacts, via `SALADFINGERS_ZSTD_WINDOW_LOG`
+/// (10–31, i.e. 1 KiB–2 GiB). Unset by default, meaning libzstd's per-level
+/// window.
+///
+/// Off by default for the same reason as the level: the payloads this engine
+/// carries are incompressible weights, where a large window buys nothing and
+/// costs memory. libzstd clamps the window to the input, so it is a ceiling
+/// rather than a flat allocation — but a 294 MiB checkpoint would still size
+/// its window to match, on a node that is simultaneously training.
+///
+/// Measured on the 941 MiB tokenized TinyStories training set, each result
+/// round-tripped and checksummed against the source:
+///
+/// | setting                   | size    | time  |
+/// |---------------------------|---------|-------|
+/// | level 3 (the default)     | 472 MiB |   2 s |
+/// | level 19, default window  | 318 MiB | 196 s |
+/// | level 19, window log 31   | 311 MiB | 200 s |
+/// | level 20, window log 31   | 300 MiB | 326 s |
+///
+/// The window is worth about 2% here — not the order of magnitude "repetitive
+/// text" might suggest. The payload is `u16` GPT-2 token ids, which carry
+/// little long-range duplication at the BYTE level even though the underlying
+/// prose repeats heavily. The level is the larger lever, and most of what it
+/// offers has arrived by 19.
+///
+/// The knob is still exposed: it costs nothing when the data does not suit it,
+/// and a corpus shipped as raw text rather than pre-tokenized ids would be a
+/// very different case. Setting it enables long-distance matching alongside the
+/// window, since a large window without LDM mostly costs memory rather than
+/// finding matches.
+///
+/// Set it to a smaller log if a node ever proves memory-tight: the agent shares
+/// this path for checkpoint uploads, and while the clamp keeps the cost
+/// proportional to the artifact, a multi-hundred-MB checkpoint will size its
+/// window accordingly.
+fn zstd_window_log() -> Option<u32> {
+    zstd_window_log_from(ZSTD_WINDOW_LOG_OVERRIDE.load(Ordering::Relaxed), &real_env)
+}
+
+/// Pure form of [`zstd_window_log`] — see [`zstd_level_from`].
+fn zstd_window_log_from(override_raw: i32, env: &impl Fn(&str) -> Option<String>) -> Option<u32> {
+    if let Some(w) = compression_override(override_raw, 10..=31) {
+        return Some(w as u32);
+    }
+    env(ZSTD_WINDOW_LOG_ENV)
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|l| (10..=31).contains(l))
+}
+
+/// The real-environment adapter for the seams above. Trimming and
+/// empty-filtering live in the parsers — the testable side of the seam — so
+/// this stays a plain lookup.
+fn real_env(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+/// Ceiling the decoder will accept, as a window log.
+///
+/// libzstd's streaming decoder defaults to refusing any frame declaring a
+/// window above `ZSTD_WINDOWLOG_LIMIT_DEFAULT` (27 — 128 MiB), so anything
+/// compressed with a larger window would download fine and then fail to
+/// extract. Since [`zstd_window_log`] can go to 31, the decoder is raised to
+/// match.
+///
+/// This is a limit, not an allocation: the decoder still sizes its buffer from
+/// the frame header, so ordinary artifacts are unaffected. It only removes a
+/// refusal that would otherwise strand an upload we had already paid for.
+const ZSTD_DECODER_WINDOW_LOG_MAX: u32 = 31;
+
+/// Apply the tuning above to a fresh encoder.
+fn tune_encoder<W: Write>(encoder: &mut zstd::Encoder<'_, W>) -> Result<()> {
+    if let Some(log) = zstd_window_log() {
+        encoder
+            .set_parameter(zstd::zstd_safe::CParameter::EnableLongDistanceMatching(
+                true,
+            ))
+            .context("enabling zstd long-distance matching")?;
+        encoder
+            .set_parameter(zstd::zstd_safe::CParameter::WindowLog(log))
+            .context("setting zstd window log")?;
+    }
+    Ok(())
+}
 
 /// Connect timeout for a transfer request: a node that cannot open the TCP connection
 /// this quickly is treated as dead (retried, then the run reallocates).
@@ -404,7 +585,8 @@ fn sha256_file(path: &Path) -> Result<String> {
 fn compress(source: &Path, archive: bool) -> Result<(NamedTempFile, String, u64)> {
     let temp = NamedTempFile::new().context("creating upload temp file")?;
     let writer = HashWriter::new(temp.reopen()?);
-    let mut encoder = zstd::Encoder::new(writer, 3).context("creating zstd encoder")?;
+    let mut encoder = zstd::Encoder::new(writer, zstd_level()).context("creating zstd encoder")?;
+    tune_encoder(&mut encoder)?;
     if archive {
         let mut builder = tar::Builder::new(&mut encoder);
         if source.is_dir() {
@@ -434,7 +616,8 @@ fn compress(source: &Path, archive: bool) -> Result<(NamedTempFile, String, u64)
 fn compress_entries(base: &Path, rel_paths: &[String]) -> Result<(NamedTempFile, String, u64)> {
     let temp = NamedTempFile::new().context("creating upload temp file")?;
     let writer = HashWriter::new(temp.reopen()?);
-    let mut encoder = zstd::Encoder::new(writer, 3).context("creating zstd encoder")?;
+    let mut encoder = zstd::Encoder::new(writer, zstd_level()).context("creating zstd encoder")?;
+    tune_encoder(&mut encoder)?;
     {
         let mut builder = tar::Builder::new(&mut encoder);
         for rel in rel_paths {
@@ -476,7 +659,12 @@ fn decompress_limit(compressed_len: u64) -> u64 {
 /// an unbounded write to the operator's disk.
 fn decompress_limited(compressed: &Path, dest: &Path, archive: bool, limit: u64) -> Result<()> {
     let file = std::fs::File::open(compressed)?;
-    let decoder = zstd::Decoder::new(file).context("creating zstd decoder")?;
+    let mut decoder = zstd::Decoder::new(file).context("creating zstd decoder")?;
+    // Accept the large-window frames `zstd_window_log` can produce; without this
+    // the decoder refuses anything above 128 MiB and the artifact is unreadable.
+    decoder
+        .window_log_max(ZSTD_DECODER_WINDOW_LOG_MAX)
+        .context("raising zstd decoder window limit")?;
     let mut reader = LimitedReader::new(decoder, limit);
     if archive {
         std::fs::create_dir_all(dest)?;
@@ -796,6 +984,132 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read(&dst_file).unwrap(), vec![42u8; 12345]);
+    }
+
+    /// Build the env lookup the compression-tunable tests share.
+    fn env_of(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_set_compression_override_beats_the_env() {
+        let env = env_of(&[(ZSTD_LEVEL_ENV, "7"), (ZSTD_WINDOW_LOG_ENV, "12")]);
+        let env = |k: &str| env.get(k).cloned();
+        assert_eq!(zstd_level_from(19, &env), 19);
+        assert_eq!(zstd_window_log_from(26, &env), Some(26));
+    }
+
+    #[test]
+    fn the_unset_sentinel_falls_through_to_the_env_then_the_default() {
+        let set = env_of(&[(ZSTD_LEVEL_ENV, "7"), (ZSTD_WINDOW_LOG_ENV, "12")]);
+        let set = |k: &str| set.get(k).cloned();
+        let empty = env_of(&[]);
+        let empty = |k: &str| empty.get(k).cloned();
+        assert_eq!(zstd_level_from(i32::MIN, &set), 7);
+        assert_eq!(zstd_level_from(i32::MIN, &empty), 3);
+        assert_eq!(zstd_window_log_from(i32::MIN, &set), Some(12));
+        assert_eq!(zstd_window_log_from(i32::MIN, &empty), None);
+    }
+
+    /// [`set_compression`] stores unvalidated and validity is judged at each
+    /// read — an illegal store must fall through to the env, never clamp.
+    #[test]
+    fn an_out_of_range_override_is_ignored_on_read_not_clamped() {
+        let env = env_of(&[(ZSTD_LEVEL_ENV, "7"), (ZSTD_WINDOW_LOG_ENV, "12")]);
+        let env = |k: &str| env.get(k).cloned();
+        let empty = env_of(&[]);
+        let empty = |k: &str| empty.get(k).cloned();
+        assert_eq!(zstd_level_from(0, &env), 7);
+        assert_eq!(zstd_level_from(23, &env), 7);
+        assert_eq!(zstd_level_from(23, &empty), 3);
+        assert_eq!(zstd_window_log_from(9, &env), Some(12));
+        assert_eq!(zstd_window_log_from(32, &env), Some(12));
+        assert_eq!(zstd_window_log_from(32, &empty), None);
+    }
+
+    #[test]
+    fn a_malformed_env_value_is_ignored() {
+        for bad in ["banana", "", "3.5"] {
+            let env = env_of(&[(ZSTD_LEVEL_ENV, bad), (ZSTD_WINDOW_LOG_ENV, bad)]);
+            let env = |k: &str| env.get(k).cloned();
+            assert_eq!(zstd_level_from(i32::MIN, &env), 3, "level {bad:?}");
+            assert_eq!(zstd_window_log_from(i32::MIN, &env), None, "window {bad:?}");
+        }
+    }
+
+    /// Pins the trim semantics the plain [`real_env`] adapter relies on: the
+    /// parsers must accept padded values, the way `image.rs`'s `non_empty_env`
+    /// would have trimmed them before parsing.
+    #[test]
+    fn a_padded_env_value_still_parses() {
+        let env = env_of(&[(ZSTD_LEVEL_ENV, " 19 "), (ZSTD_WINDOW_LOG_ENV, " 26 ")]);
+        let env = |k: &str| env.get(k).cloned();
+        assert_eq!(zstd_level_from(i32::MIN, &env), 19);
+        assert_eq!(zstd_window_log_from(i32::MIN, &env), Some(26));
+    }
+
+    #[test]
+    fn an_out_of_range_env_is_ignored_not_clamped() {
+        for (level, window) in [("0", "9"), ("23", "32")] {
+            let env = env_of(&[(ZSTD_LEVEL_ENV, level), (ZSTD_WINDOW_LOG_ENV, window)]);
+            let env = |k: &str| env.get(k).cloned();
+            assert_eq!(zstd_level_from(i32::MIN, &env), 3, "level {level}");
+            assert_eq!(
+                zstd_window_log_from(i32::MIN, &env),
+                None,
+                "window {window}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_range_edges_are_live() {
+        for (level, window) in [("1", "10"), ("22", "31")] {
+            let env = env_of(&[(ZSTD_LEVEL_ENV, level), (ZSTD_WINDOW_LOG_ENV, window)]);
+            let env = |k: &str| env.get(k).cloned();
+            assert_eq!(
+                zstd_level_from(i32::MIN, &env),
+                level.parse::<i32>().unwrap()
+            );
+            assert_eq!(
+                zstd_window_log_from(i32::MIN, &env),
+                Some(window.parse::<u32>().unwrap())
+            );
+        }
+    }
+
+    /// The decoder must accept the large-window frames [`set_compression`] can
+    /// produce. Streaming compression never pledges a source size, so libzstd
+    /// skips its window clamp and even a KiB-scale frame declares the full 2^31
+    /// window in its header — a default decoder (limit 2^27, 128 MiB) refuses
+    /// it with "Frame requires too much memory", so no large payload is needed
+    /// to prove [`ZSTD_DECODER_WINDOW_LOG_MAX`] load-bearing. (nextest runs one
+    /// process per test, so the process-global override set here cannot leak.)
+    #[tokio::test]
+    async fn a_window_log_31_upload_round_trips_through_the_raised_decoder() {
+        set_compression(Some(19), Some(31));
+        let (base, _store) = storage_server().await;
+        let src = tempfile::tempdir().unwrap();
+        let src_file = src.path().join("payload.bin");
+        // Non-trivial bytes so the frame carries real compressed blocks.
+        let payload: Vec<u8> = (0..8192u32).map(|i| (i * 31 % 251) as u8).collect();
+        std::fs::write(&src_file, &payload).unwrap();
+
+        let http = reqwest::Client::new();
+        let urls = vec![format!("{base}/payload.tzst.000")];
+        let report = upload_artifact(&http, &src_file, false, &urls, "payload")
+            .await
+            .unwrap();
+
+        let dst = tempfile::tempdir().unwrap();
+        let dst_file = dst.path().join("payload.out");
+        download_artifact(&http, &urls, &dst_file, false, Some(&report.sha256))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dst_file).unwrap(), payload);
     }
 
     // A storage server whose PUT and GET for a chosen key fail the first `flaky` times
