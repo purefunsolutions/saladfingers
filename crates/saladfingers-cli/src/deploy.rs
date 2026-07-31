@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use saladfingers_api::{
-    BasicAuth, ContainerPriority, CreateContainer, CreateContainerGroup, GroupStatus, Instance,
-    InstanceState, Networking, RegistryAuthentication, Resources, RestartPolicy, SaladClient,
+    BasicAuth, ContainerPriority, CreateContainer, CreateContainerGroup, GpuClass, GroupStatus,
+    Instance, InstanceState, Networking, RegistryAuthentication, Resources, RestartPolicy,
+    SaladClient,
 };
 
 use crate::commands;
@@ -21,6 +22,35 @@ use crate::state;
 
 /// GPU-class cache TTL (hours).
 const CACHE_TTL_HOURS: i64 = 24;
+
+/// Resolve GPU-class names or UUIDs to the full classes via the cached class list.
+///
+/// The canonical `name` on each result is what a raw-UUID request cannot supply itself —
+/// callers that want to reason about *what* was asked for (e.g. which vendor's query
+/// tool the node will answer to) reason about these, never the caller-typed strings.
+///
+/// # Errors
+/// Returns an error if the class list cannot be fetched or a name does not match.
+pub async fn resolve_gpu_classes(
+    client: &SaladClient,
+    classes: &[String],
+    refresh: bool,
+) -> Result<Vec<GpuClass>> {
+    // A CPU-only request names no class, so it must not depend on the class list being
+    // fetchable: with a cold cache and the API down, `?` below would fail a run that
+    // asked nothing about GPUs.
+    if classes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let available = state::cached_gpu_classes(client, refresh, CACHE_TTL_HOURS).await?;
+    let mut resolved = Vec::with_capacity(classes.len());
+    for name in classes {
+        let class = commands::resolve_gpu_class(&available, name)
+            .map_err(|e| anyhow::anyhow!("GPU class '{name}': {e}"))?;
+        resolved.push(class.clone());
+    }
+    Ok(resolved)
+}
 
 /// Resolve GPU-class names or UUIDs to UUIDs via the cached class list.
 ///
@@ -31,20 +61,11 @@ pub async fn resolve_gpu_uuids(
     classes: &[String],
     refresh: bool,
 ) -> Result<Vec<String>> {
-    // A CPU-only request names no class, so it must not depend on the class list being
-    // fetchable: with a cold cache and the API down, `?` below would fail a run that
-    // asked nothing about GPUs.
-    if classes.is_empty() {
-        return Ok(Vec::new());
-    }
-    let available = state::cached_gpu_classes(client, refresh, CACHE_TTL_HOURS).await?;
-    let mut uuids = Vec::with_capacity(classes.len());
-    for name in classes {
-        let class = commands::resolve_gpu_class(&available, name)
-            .map_err(|e| anyhow::anyhow!("GPU class '{name}': {e}"))?;
-        uuids.push(class.id.clone());
-    }
-    Ok(uuids)
+    Ok(resolve_gpu_classes(client, classes, refresh)
+        .await?
+        .into_iter()
+        .map(|c| c.id)
+        .collect())
 }
 
 /// Best-effort hourly USD price for `class_name` at `priority`, from the cached

@@ -21,6 +21,7 @@ use base64::Engine;
 use chrono::Utc;
 use reqwest::Method;
 use saladfingers_api::{RestartPolicy, SaladClient};
+use saladfingers_protocol::GpuVendor;
 use saladfingers_protocol::agent_api::{
     self, ExecCreated, ExecRequest, FileStat, Health, OutputPage, UploadInit, UploadInitResponse,
     UploadStatus,
@@ -85,7 +86,11 @@ pub async fn create(cfg: Config, args: SessionCreateArgs) -> Result<()> {
         .with_context(|| format!("invalid --max-duration {:?}", args.max_duration))?
         .as_secs();
 
-    let uuids = deploy::resolve_gpu_uuids(&client, &gpu_classes, false).await?;
+    let resolved = deploy::resolve_gpu_classes(&client, &gpu_classes, false).await?;
+    // Decided from the CANONICAL class names, so a class requested by raw UUID still
+    // classifies — the caller-typed strings could not answer for one.
+    let vendor = vendor_hint(resolved.iter().map(|c| c.name.as_str()));
+    let uuids = resolved.into_iter().map(|c| c.id).collect();
     let mut env = profile.as_ref().map(|p| p.env.clone()).unwrap_or_default();
     env.insert("SF_AGENT_TOKEN".into(), token.clone());
     env.insert("SF_PORT".into(), AGENT_PORT.to_string());
@@ -169,7 +174,7 @@ pub async fn create(cfg: Config, args: SessionCreateArgs) -> Result<()> {
     // Record which GPU this actually landed on, while the agent is connected and the box
     // is alive: SaladCloud will never tell us (see `RunState::gpu_observed`), and once the
     // group is deleted there is nothing left to ask.
-    run.gpu_observed = observe_gpu(&agent).await;
+    run.gpu_observed = observe_gpu(&agent, vendor).await;
     state::save_run(&run)?;
 
     // Self-exit does not stop billing (the platform relaunches the container on every
@@ -310,31 +315,61 @@ fn gpu_cell(s: &state::RunState) -> String {
     }
 }
 
+/// Which vendor's query tool the requested classes say the node will answer to.
+///
+/// SaladCloud's live class list spells every AMD class with an `AMD` prefix and no
+/// NVIDIA class with one, so the canonical names decide without another API call.
+/// `None` means the request itself does not decide — a list mixing vendors — and the
+/// observer must try both.
+fn vendor_hint<'a>(names: impl Iterator<Item = &'a str>) -> Option<GpuVendor> {
+    let mut saw = (false, false); // (amd, nvidia)
+    for name in names {
+        // "May contain leading whitespace" — the GpuClass field's own doc.
+        if name.trim_start().to_ascii_lowercase().starts_with("amd") {
+            saw.0 = true;
+        } else {
+            saw.1 = true;
+        }
+    }
+    match saw {
+        (true, false) => Some(GpuVendor::Amd),
+        (false, true) => Some(GpuVendor::Nvidia),
+        _ => None,
+    }
+}
+
 /// Ask the node what GPU it actually has, for [`state::RunState::gpu_observed`].
 ///
-/// NVIDIA first: the host injects `nvidia-smi` into every container on an NVIDIA node,
-/// so it answers even in an image with no CUDA layer. Then ROCm via `rocminfo`, which
-/// exists only when the image baked it in (`rocm-runtime` flavor) — Salad's AMD nodes
-/// are WSL2 and inject no ROCm userspace at all ([empirical.md] E13), so on AMD this
-/// works exactly when the image could run GPU work in the first place.
+/// `vendor` (from [`vendor_hint`]) picks the tool, because the two are asymmetric and
+/// each is the only one its node can answer: the host injects `nvidia-smi` into every
+/// container on an NVIDIA node (even an image with no CUDA layer), while Salad's AMD
+/// nodes are WSL2 and inject no ROCm userspace at all ([empirical.md] E13) — there
+/// `rocminfo` exists exactly when the image baked the `rocm-runtime` flavor, which is
+/// exactly when the session could run GPU work in the first place. An undecided hint
+/// (mixed-vendor request) tries both, NVIDIA first.
 ///
 /// Best effort by construction: the caller has a working session and must not lose it
-/// over a table column, so every failure — neither tool present, an exec the agent
-/// refuses, unparsable output — returns `None` and leaves the honest fallback in
-/// [`gpu_cell`] to explain itself.
-async fn observe_gpu(agent: &AgentClient) -> Option<String> {
-    if let Ok(out) = exec_capture(
-        agent,
-        vec![
-            "nvidia-smi".into(),
-            "--query-gpu=name,memory.total".into(),
-            "--format=csv,noheader".into(),
-        ],
-    )
-    .await
-        && let Some(gpu) = parse_smi_gpu(&out)
-    {
-        return Some(gpu);
+/// over a table column, so every failure — the tool absent, an exec the agent refuses,
+/// unparsable output — returns `None` and leaves the honest fallback in [`gpu_cell`]
+/// to explain itself.
+async fn observe_gpu(agent: &AgentClient, vendor: Option<GpuVendor>) -> Option<String> {
+    if vendor != Some(GpuVendor::Amd) {
+        if let Ok(out) = exec_capture(
+            agent,
+            vec![
+                "nvidia-smi".into(),
+                "--query-gpu=name,memory.total".into(),
+                "--format=csv,noheader".into(),
+            ],
+        )
+        .await
+            && let Some(gpu) = parse_smi_gpu(&out)
+        {
+            return Some(gpu);
+        }
+        if vendor == Some(GpuVendor::Nvidia) {
+            return None;
+        }
     }
     let out = exec_capture(agent, vec!["rocminfo".into()]).await.ok()?;
     parse_rocminfo_gpu(&out)
@@ -984,6 +1019,27 @@ mod tests {
         assert_eq!(parse_smi_gpu(""), None);
         assert_eq!(parse_smi_gpu("no such command"), None);
         assert_eq!(parse_smi_gpu("NVIDIA GeForce RTX 2060, [N/A]"), None);
+    }
+
+    /// The requested classes decide which vendor's tool the observer runs — from the
+    /// CANONICAL names (a raw-UUID request resolves to one before this), and matching
+    /// how the live class list is spelled: every AMD class is `AMD`-prefixed, no NVIDIA
+    /// class is. A mixed request decides nothing and the observer tries both.
+    #[test]
+    fn the_requested_classes_pick_the_query_tool() {
+        let hint = |names: &[&str]| vendor_hint(names.iter().copied());
+        assert_eq!(
+            hint(&["AMD RX 7800 XT (16GB)", "AMD RX 9060 XT (16GB)"]),
+            Some(GpuVendor::Amd)
+        );
+        assert_eq!(
+            hint(&["GTX 1650 (4 GB)", "RTX 3060 (12 GB)"]),
+            Some(GpuVendor::Nvidia)
+        );
+        assert_eq!(hint(&["RTX 3060 (12 GB)", "AMD RX 7800 XT (16GB)"]), None);
+        assert_eq!(hint(&[]), None);
+        // The class list's documented quirk: names may carry leading whitespace.
+        assert_eq!(hint(&["  AMD RX 7800 XT (16GB)"]), Some(GpuVendor::Amd));
     }
 
     /// The shape rocminfo actually prints: CPU agent first (whose GLOBAL pool is host
