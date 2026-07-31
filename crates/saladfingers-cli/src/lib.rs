@@ -79,6 +79,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Command::Checkpoint(sub) => match sub {
             CheckpointCommand::Show(args) => checkpoint::show(resolve()?, args).await,
             CheckpointCommand::Fetch(args) => checkpoint::fetch(resolve()?, args).await,
+            CheckpointCommand::Rm(args) => checkpoint::rm(resolve()?, args).await,
         },
         Command::Gc(args) => admin::gc(resolve()?, args).await,
         Command::Session(sub) => match sub {

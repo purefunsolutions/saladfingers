@@ -362,10 +362,15 @@ pub async fn gc(cfg: Config, args: GcArgs) -> Result<()> {
             Ok(backend) => {
                 let http = reqwest::Client::new();
                 for rid in &reaped_run_ids {
-                    let prefix = format!("runs/{rid}/");
+                    let prefix = crate::spec::run_prefix(rid);
                     match backend.delete_prefix(&http, &prefix).await {
-                        Ok(n) if n > 0 => eprintln!("removed {n} object(s) under {prefix}"),
-                        Ok(_) => {}
+                        Ok((0, 0)) => {}
+                        Ok((n, 0)) => eprintln!("removed {n} object(s) under {prefix}"),
+                        // Best-effort here, but not silent: what survives is storage
+                        // waste the operator would otherwise never learn about.
+                        Ok((n, failed)) => eprintln!(
+                            "removed {n} object(s) under {prefix}; {failed} could not be deleted"
+                        ),
                         Err(e) => eprintln!("prefix cleanup for {prefix} failed: {e}"),
                     }
                 }
@@ -524,7 +529,7 @@ fn prompt_bool(question: &str, default: bool) -> Result<bool> {
     })
 }
 
-fn confirm(question: &str) -> Result<bool> {
+pub(crate) fn confirm(question: &str) -> Result<bool> {
     prompt_bool(question, false)
 }
 

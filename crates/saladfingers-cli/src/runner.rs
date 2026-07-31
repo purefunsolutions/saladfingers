@@ -1597,7 +1597,7 @@ fn save_state(cfg: &Config, run_id: &str, params: &RunParams, groups: &[GroupRef
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1618,7 +1618,34 @@ mod tests {
 
     /// A `Config` with nothing configured — the parts `resolve_params` reads are
     /// the defaults and the profile, not the org/key/storage.
-    pub(super) fn bare_config() -> Config {
+    /// A [`state::RunState`] with everything defaulted — for tests that need a run on
+    /// disk, not a particular run.
+    pub(crate) fn minimal_run_state(run_id: &str, status: &str) -> state::RunState {
+        state::RunState {
+            v: state::STATE_VERSION,
+            run_id: run_id.into(),
+            kind: "run".into(),
+            created_at: chrono::Utc::now(),
+            org: "org".into(),
+            project: "proj".into(),
+            profile: None,
+            image: None,
+            gpu_classes: vec![],
+            gpu_observed: None,
+            priority: None,
+            command: vec![],
+            output_names: None,
+            max_parts: None,
+            checkpoint_prefix: None,
+            groups: vec![],
+            status: status.into(),
+            agent_token: None,
+            max_duration_secs: None,
+            result: None,
+        }
+    }
+
+    pub(crate) fn bare_config() -> Config {
         Config {
             organization: "org".into(),
             project: "proj".into(),
@@ -1855,28 +1882,8 @@ mod tests {
             std::env::set_var("XDG_STATE_HOME", dir.path());
         }
 
-        let mut run = state::RunState {
-            v: state::STATE_VERSION,
-            run_id: "sf-live01".into(),
-            kind: "run".into(),
-            created_at: chrono::Utc::now(),
-            org: "org".into(),
-            project: "proj".into(),
-            profile: None,
-            image: None,
-            gpu_classes: vec![],
-            gpu_observed: None,
-            priority: None,
-            command: vec![],
-            output_names: None,
-            max_parts: None,
-            checkpoint_prefix: Some("tinystories-77m".into()),
-            groups: vec![],
-            status: "running".into(),
-            agent_token: None,
-            max_duration_secs: None,
-            result: None,
-        };
+        let mut run = minimal_run_state("sf-live01", "running");
+        run.checkpoint_prefix = Some("tinystories-77m".into());
         state::save_run(&run).unwrap();
 
         // Through `resolve_params`, not the guard alone: the guard being correct is worth

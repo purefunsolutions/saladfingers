@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0 OR BSD-3-Clause
 
-//! `saladfingers checkpoint show|fetch` — read the checkpoint a run left in storage.
+//! `saladfingers checkpoint show|fetch|rm` — the checkpoint a run left in storage.
 //!
 //! Checkpoints exist so a long training job survives losing its node, which means the
 //! useful artifact usually outlives the run that produced it: a job cut short at step
@@ -322,6 +322,93 @@ pub async fn fetch_into(
     Ok(meta)
 }
 
+/// `saladfingers checkpoint rm --prefix NAME`
+///
+/// A run-scoped checkpoint needs no equivalent: it lives under `runs/<id>/`, inside the
+/// run's own storage lifecycle. A shared one is deliberately outside that, which leaves
+/// it with no reaper at all — and since an unrestorable checkpoint now fails every run
+/// that points at the prefix, it also needs a way out. This is it.
+///
+/// Lists before prompting, so the confirmation shows how many objects across which
+/// shards are about to go — the moment a transposed name becomes visible. A partial
+/// delete is an error, not a success with a smaller number.
+///
+/// # Errors
+/// Returns an error when the name is unusable, local run state cannot be read (the
+/// live-run guard must be able to run before anything is deleted), a local run is still
+/// writing to the prefix, storage is unconfigured or unreachable, or any object could
+/// not be deleted.
+pub async fn rm(cfg: Config, args: crate::cli::CheckpointRmArgs) -> Result<()> {
+    spec::validate_checkpoint_prefix(&args.prefix)?;
+    // Deleting under a live run's ring is the same two-writers disaster as launching a
+    // second run on the prefix, with the added twist that the run would keep committing
+    // metadata for parts that are being removed underneath it. Unlike `run`'s use of the
+    // guard, an unreadable state dir is a hard stop here: `run` failing open risks a
+    // corrupted ring, `rm` failing open deletes the weights a live run is rotating. The
+    // guard's window is also wider than it looks — a starting run claims its prefix only
+    // after its input upload — so a delete racing a just-launched resume can win; the
+    // prompt below is the moment to be sure nothing is starting.
+    let runs = crate::state::list_runs().context(
+        "cannot read local run state, so the live-run guard cannot run; refusing to \
+         delete a prefix a live run may be writing to",
+    )?;
+    if let Some(run) = runs.iter().find(|r| {
+        r.checkpoint_prefix.as_deref() == Some(args.prefix.as_str())
+            && !crate::admin::is_terminal(&r.status)
+    }) {
+        anyhow::bail!(
+            "run {} ({}) is still using checkpoint prefix '{}' — cancel it first",
+            run.run_id,
+            run.status,
+            args.prefix
+        );
+    }
+    let (http, backend) = backend_of(&cfg)?;
+
+    // List before prompting: "48 objects across shards 0-3" is what makes a transposed
+    // name visible at the prompt instead of after the delete.
+    let prefix = spec::checkpoint_prefix_root(&args.prefix);
+    let keys = backend
+        .list_keys(&http, &prefix)
+        .await
+        .with_context(|| format!("listing {prefix}"))?;
+    if keys.is_empty() {
+        eprintln!("nothing stored under {prefix}");
+        return Ok(());
+    }
+    let mut shards: Vec<&str> = keys
+        .iter()
+        .filter_map(|k| k.strip_prefix(&prefix)?.split('/').next())
+        .collect();
+    shards.sort_unstable();
+    shards.dedup();
+    if !args.yes
+        && !crate::admin::confirm(&format!(
+            "Delete checkpoint prefix '{}' ({} object(s) under {prefix}, shard(s) {})?",
+            args.prefix,
+            keys.len(),
+            shards.join(",")
+        ))?
+    {
+        eprintln!("aborted");
+        return Ok(());
+    }
+    let (deleted, failed) = backend
+        .delete_prefix(&http, &prefix)
+        .await
+        .with_context(|| format!("deleting {prefix}"))?;
+    // A partial delete is a failure, loudly: reporting success here would leave stale
+    // parts (or worse, live metadata) behind a name the operator now believes is clean —
+    // and a later run with this prefix would resume from whatever survived.
+    anyhow::ensure!(
+        failed == 0,
+        "deleted {deleted} object(s) under {prefix}, but {failed} could not be deleted — \
+         the prefix is NOT clean; check the storage credentials' delete permission and rerun"
+    );
+    eprintln!("deleted {deleted} object(s) under {prefix}");
+    Ok(())
+}
+
 fn human_bytes(bytes: u64) -> String {
     #[allow(clippy::cast_precision_loss)]
     let b = bytes as f64;
@@ -446,6 +533,61 @@ mod tests {
                 "clap must accept {argv:?}"
             );
         }
+    }
+
+    /// `rm` must refuse to run blind. Both guards fire BEFORE storage is opened — that
+    /// ordering is the test's hidden assertion, since the config here has no `[storage]`
+    /// and reaching `backend_of` would produce a different error entirely.
+    //
+    // The env lock is deliberately held across the awaits: it serializes the WHOLE test
+    // against the other XDG_STATE_HOME-mutating tests, and nothing else ever takes it,
+    // so the deadlock the lint guards against cannot form.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn rm_refuses_when_the_live_run_guard_cannot_run_or_trips() {
+        let _env = crate::state::TEST_STATE_ENV.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: serialized by TEST_STATE_ENV; scopes state to the tempdir.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", dir.path());
+        }
+        let rm_args = |prefix: &str| crate::cli::CheckpointRmArgs {
+            prefix: prefix.into(),
+            yes: true,
+        };
+
+        // A live local run claims the prefix → refused, before any storage access.
+        let mut run = crate::runner::tests::minimal_run_state("sf-live02", "running");
+        run.checkpoint_prefix = Some("tinystories-77m".into());
+        crate::state::save_run(&run).unwrap();
+        let err = rm(
+            crate::runner::tests::bare_config(),
+            rm_args("tinystories-77m"),
+        )
+        .await
+        .expect_err("a live run's prefix must not be deletable");
+        assert!(
+            format!("{err:#}").contains("sf-live02"),
+            "the refusal should name the run: {err:#}"
+        );
+
+        // Unreadable state → hard error, NOT the fail-open warning `run` uses: `run`
+        // failing open risks a corrupted ring, `rm` failing open deletes live weights.
+        std::fs::write(
+            crate::state::run_path("sf-corrupt").unwrap(),
+            b"not json at all",
+        )
+        .unwrap();
+        let err = rm(
+            crate::runner::tests::bare_config(),
+            rm_args("some-other-prefix"),
+        )
+        .await
+        .expect_err("rm must not proceed when the guard cannot run");
+        assert!(
+            format!("{err:#}").contains("guard cannot run"),
+            "the error should say why deleting is refused: {err:#}"
+        );
     }
 
     #[test]

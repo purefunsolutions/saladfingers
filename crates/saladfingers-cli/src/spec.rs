@@ -164,6 +164,26 @@ pub fn validate_checkpoint_prefix(prefix: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Everything a run owns, as a *list* prefix — what `gc` reaps.
+///
+/// The trailing slash is load-bearing and is why this is a function rather than a
+/// `format!` at each call site: a list prefix matches by string, so `runs/sf-x` would
+/// also match `runs/sf-x9.../`, and the caller would delete another run's artifacts
+/// while reporting a successful cleanup of its own.
+#[must_use]
+pub fn run_prefix(run_id: &str) -> String {
+    format!("runs/{run_id}/")
+}
+
+/// Everything a shared checkpoint owns, across every shard — what `checkpoint rm` deletes.
+///
+/// Same trailing-slash rule as [`run_prefix`], and the same reason: without it,
+/// `--prefix foo` would take `ckpts/foobar/` with it.
+#[must_use]
+pub fn checkpoint_prefix_root(name: &str) -> String {
+    format!("ckpts/{name}/")
+}
+
 /// The storage key stem for input `index` (shared across shards).
 #[must_use]
 pub fn input_stem(run_id: &str, index: usize) -> String {
@@ -409,6 +429,29 @@ mod tests {
             assert!(slot.get_urls[0].contains(&key));
             assert!(slot.delete_urls[0].contains(&key));
             assert!(slot.delete_urls[0].contains("X-Amz-Signature"));
+        }
+    }
+
+    /// A list prefix matches by string, and both of these drive bulk deletes — `gc` over a
+    /// run, `checkpoint rm` over a shared name. Drop the trailing slash and `sf-x` reaps
+    /// `sf-x9k2mq`'s artifacts, or `--prefix foo` takes `foobar` with it, in both cases
+    /// reporting a successful cleanup of something else.
+    #[test]
+    fn a_deletable_prefix_ends_at_a_directory_boundary() {
+        assert_eq!(run_prefix("sf-x"), "runs/sf-x/");
+        assert_eq!(checkpoint_prefix_root("foo"), "ckpts/foo/");
+
+        for (narrow, wider) in [
+            (run_prefix("sf-x"), run_prefix("sf-x9k2mq")),
+            (
+                checkpoint_prefix_root("foo"),
+                checkpoint_prefix_root("foobar"),
+            ),
+        ] {
+            assert!(
+                !wider.starts_with(&narrow),
+                "deleting {narrow} would also match {wider}"
+            );
         }
     }
 

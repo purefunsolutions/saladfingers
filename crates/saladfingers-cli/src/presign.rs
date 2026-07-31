@@ -100,15 +100,13 @@ impl S3Backend {
             .to_string()
     }
 
-    /// Delete every object under `prefix`, returning the count deleted. Used by `gc` to
-    /// reap a finished run's remote artifacts. Best-effort: individual delete failures
-    /// are skipped, not fatal.
+    /// List every object key under `prefix`, following continuation tokens.
     ///
     /// # Errors
-    /// Returns an error if listing the bucket fails.
-    pub async fn delete_prefix(&self, http: &reqwest::Client, prefix: &str) -> Result<usize> {
+    /// Returns an error if a list request fails.
+    pub async fn list_keys(&self, http: &reqwest::Client, prefix: &str) -> Result<Vec<String>> {
         let expires = Duration::from_secs(300);
-        let mut deleted = 0usize;
+        let mut keys = Vec::new();
         let mut token: Option<String> = None;
         loop {
             let mut list = self.bucket.list_objects_v2(Some(&self.credentials));
@@ -121,8 +119,13 @@ impl S3Backend {
             // capability over this bucket and must not reach error text. `.context` does
             // not help: the reqwest source still carries the URL, and anyhow prints the
             // whole chain under `{:#}` / `Debug` (which is what `main` renders).
+            //
+            // CONTROL_TIMEOUT: a list response is a bounded control document, and without
+            // a deadline an endpoint that accepts the connection and never answers hangs
+            // `gc` and `checkpoint rm` forever, after their confirmation prompts.
             let body = http
                 .get(url)
+                .timeout(saladfingers_protocol::transfer::CONTROL_TIMEOUT)
                 .send()
                 .await
                 .map_err(reqwest::Error::without_url)
@@ -135,21 +138,53 @@ impl S3Backend {
                 .map_err(reqwest::Error::without_url)?;
             let parsed = rusty_s3::actions::ListObjectsV2::parse_response(&body)
                 .context("parsing list-objects response")?;
-            for obj in &parsed.contents {
-                let del = self
-                    .bucket
-                    .delete_object(Some(&self.credentials), &obj.key)
-                    .sign(expires);
-                if matches!(http.delete(del).send().await, Ok(r) if r.status().is_success()) {
-                    deleted += 1;
-                }
-            }
+            keys.extend(parsed.contents.iter().map(|obj| obj.key.clone()));
             match parsed.next_continuation_token {
                 Some(t) => token = Some(t),
                 None => break,
             }
         }
-        Ok(deleted)
+        Ok(keys)
+    }
+
+    /// Delete every object under `prefix`, returning `(deleted, failed)` counts.
+    ///
+    /// The failed count is the caller's to judge: `gc` treats leftovers as storage waste
+    /// to report and move past, while `checkpoint rm` treats them as the job not done —
+    /// a prefix reported clean while its parts survived would be resumed from, silently.
+    ///
+    /// # Errors
+    /// Returns an error if listing the bucket fails.
+    pub async fn delete_prefix(
+        &self,
+        http: &reqwest::Client,
+        prefix: &str,
+    ) -> Result<(usize, usize)> {
+        let expires = Duration::from_secs(300);
+        let keys = self.list_keys(http, prefix).await?;
+        let mut deleted = 0usize;
+        let mut failed = 0usize;
+        for key in &keys {
+            let del = self
+                .bucket
+                .delete_object(Some(&self.credentials), key)
+                .sign(expires);
+            // Timeout for the same reason as the list: one stalled DELETE must not wedge
+            // the whole sweep.
+            let ok = matches!(
+                http.delete(del)
+                    .timeout(saladfingers_protocol::transfer::CONTROL_TIMEOUT)
+                    .send()
+                    .await,
+                Ok(r) if r.status().is_success()
+            );
+            if ok {
+                deleted += 1;
+            } else {
+                failed += 1;
+            }
+        }
+        Ok((deleted, failed))
     }
 }
 
@@ -282,6 +317,47 @@ mod tests {
         assert!(meta_put.status().is_success(), "spec meta_put_url");
         let meta_got = http.get(&ckpt.meta_get_url).send().await.unwrap();
         assert!(meta_got.status().is_success(), "spec meta_get_url");
+        // `delete_prefix` is a bulk delete driven by a LIST, so its blast radius depends on
+        // how the endpoint matches the prefix string — which only a real one settles.
+        // `checkpoint rm --prefix foo` must not take `foobar` with it, and `gc` on one run
+        // must not reap the next run whose id starts the same way.
+        // Composed from the same helper `checkpoint rm` uses, so a change there is what
+        // this catches — a literal here would keep passing while the command drifted.
+        let target = format!("smoke/{}", crate::spec::checkpoint_prefix_root("foo"));
+        let neighbour = format!("smoke/{}a", crate::spec::checkpoint_prefix_root("foobar"));
+        for key in [
+            format!("{target}a"),
+            format!("{target}b"),
+            neighbour.clone(),
+        ] {
+            let put = backend.presign_put(&key, Duration::from_secs(300));
+            let resp = http.put(&put).body(b"x".to_vec()).send().await.unwrap();
+            assert!(resp.status().is_success(), "seeding {key}");
+        }
+        let (removed, failed) = backend.delete_prefix(&http, &target).await.unwrap();
+        assert_eq!(
+            (removed, failed),
+            (2, 0),
+            "should have taken exactly foo's two objects"
+        );
+        let survivor = backend.presign_get(&neighbour, Duration::from_secs(300));
+        let resp = http.get(&survivor).send().await.unwrap();
+        assert!(
+            resp.status().is_success(),
+            "a neighbouring prefix was deleted too: {}",
+            resp.status()
+        );
+        // Leave the store as this leg found it: `round_trip` is written to run against
+        // any backend, and a persistent one would count the leaked neighbour next time.
+        let cleanup = backend.presign_delete(&neighbour, Duration::from_secs(300));
+        assert!(
+            http.delete(&cleanup)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .is_success()
+        );
     }
 
     // --- ephemeral local Garage -------------------------------------------------

@@ -104,7 +104,7 @@ pub enum Command {
     Reap(RunIdArgs),
     /// Query a run's logs (works after group deletion).
     Logs(LogsArgs),
-    /// Inspect or download a run's uploaded checkpoint.
+    /// Inspect, download, or delete an uploaded checkpoint.
     #[command(subcommand)]
     Checkpoint(CheckpointCommand),
     /// Garbage-collect leftover container groups.
@@ -368,6 +368,20 @@ pub enum CheckpointCommand {
     Show(CheckpointArgs),
     /// Download and extract the uploaded checkpoint.
     Fetch(CheckpointFetchArgs),
+    /// Delete a shared checkpoint. `gc` never reaps these — that is what makes them
+    /// shared — so this is the only way to remove one.
+    Rm(CheckpointRmArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CheckpointRmArgs {
+    /// Shared checkpoint name, as passed to `run --checkpoint-prefix`. Every shard's copy
+    /// goes with it.
+    #[arg(long, value_name = "NAME")]
+    pub prefix: String,
+    /// Skip the confirmation prompt.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Debug, Args)]
