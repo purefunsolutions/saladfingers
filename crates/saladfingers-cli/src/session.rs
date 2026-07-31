@@ -312,12 +312,18 @@ fn gpu_cell(s: &state::RunState) -> String {
 
 /// Ask the node what GPU it actually has, for [`state::RunState::gpu_observed`].
 ///
+/// NVIDIA first: the host injects `nvidia-smi` into every container on an NVIDIA node,
+/// so it answers even in an image with no CUDA layer. Then ROCm via `rocminfo`, which
+/// exists only when the image baked it in (`rocm-runtime` flavor) — Salad's AMD nodes
+/// are WSL2 and inject no ROCm userspace at all ([empirical.md] E13), so on AMD this
+/// works exactly when the image could run GPU work in the first place.
+///
 /// Best effort by construction: the caller has a working session and must not lose it
-/// over a table column, so every failure — no `nvidia-smi` (a CPU-only or ROCm image),
-/// an exec the agent refuses, unparsable output — returns `None` and leaves the honest
-/// fallback in [`gpu_cell`] to explain itself.
+/// over a table column, so every failure — neither tool present, an exec the agent
+/// refuses, unparsable output — returns `None` and leaves the honest fallback in
+/// [`gpu_cell`] to explain itself.
 async fn observe_gpu(agent: &AgentClient) -> Option<String> {
-    let out = exec_capture(
+    if let Ok(out) = exec_capture(
         agent,
         vec![
             "nvidia-smi".into(),
@@ -326,8 +332,12 @@ async fn observe_gpu(agent: &AgentClient) -> Option<String> {
         ],
     )
     .await
-    .ok()?;
-    parse_smi_gpu(&out)
+        && let Some(gpu) = parse_smi_gpu(&out)
+    {
+        return Some(gpu);
+    }
+    let out = exec_capture(agent, vec!["rocminfo".into()]).await.ok()?;
+    parse_rocminfo_gpu(&out)
 }
 
 /// `NVIDIA GeForce RTX 2060, 12288 MiB` → `RTX 2060 (12 GB)`.
@@ -350,6 +360,63 @@ fn parse_smi_gpu(out: &str) -> Option<String> {
     // Round to the nearest GB: cards report a usable 12288/8192 MiB, and the class names
     // are written in whole GB.
     Some(format!("{name} ({} GB)", mib.div_ceil(1024)))
+}
+
+/// `rocminfo` output → `AMD RX 7800 XT (16GB)`.
+///
+/// rocminfo lists the CPU agent(s) first, so the name is the `Marketing Name:` of the
+/// agent whose `Device Type:` is `GPU` — the same walk the probe's report does — and the
+/// VRAM is that agent's largest `GLOBAL` pool. Normalized into the vocabulary the live
+/// class list uses for AMD: `Radeon` dropped, an `AMD` prefix, and the size written
+/// `(16GB)` without the space the NVIDIA names carry, because that is how SaladCloud
+/// spells its AMD classes. A GPU whose pools do not parse keeps its bare name — better a
+/// size-less truth than an invented one.
+fn parse_rocminfo_gpu(out: &str) -> Option<String> {
+    let mut last_marketing: Option<&str> = None;
+    let mut gpu_name: Option<&str> = None;
+    let mut in_global_pool = false;
+    let mut vram_kib: u64 = 0;
+    for line in out.lines() {
+        let t = line.trim();
+        if let Some(name) = t.strip_prefix("Marketing Name:") {
+            if gpu_name.is_some() {
+                break; // the agent after the GPU — its pools must not count
+            }
+            last_marketing = Some(name.trim());
+        } else if t.starts_with("Device Type:") && t.contains("GPU") {
+            gpu_name = last_marketing;
+        } else if gpu_name.is_some() {
+            if let Some(seg) = t.strip_prefix("Segment:") {
+                in_global_pool = seg.contains("GLOBAL");
+            } else if in_global_pool
+                && let Some(size) = t.strip_prefix("Size:")
+                && let Some(kib) = size
+                    .trim()
+                    .strip_suffix("KB")
+                    .and_then(|s| s.split('(').next())
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+            {
+                vram_kib = vram_kib.max(kib);
+            }
+        }
+    }
+    let name = gpu_name?.replacen("Radeon ", "", 1);
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let name = if name.starts_with("AMD") {
+        name.to_string()
+    } else {
+        format!("AMD {name}")
+    };
+    if vram_kib == 0 {
+        return Some(name);
+    }
+    Some(format!(
+        "{name} ({}GB)",
+        vram_kib.div_ceil(1024).div_ceil(1024)
+    ))
 }
 
 /// Run one command in a session and collect its stdout.
@@ -917,6 +984,76 @@ mod tests {
         assert_eq!(parse_smi_gpu(""), None);
         assert_eq!(parse_smi_gpu("no such command"), None);
         assert_eq!(parse_smi_gpu("NVIDIA GeForce RTX 2060, [N/A]"), None);
+    }
+
+    /// The shape rocminfo actually prints: CPU agent first (whose GLOBAL pool is host
+    /// RAM and must NOT be read as VRAM), then the GPU agent with its pools.
+    const ROCMINFO: &str = "\
+==========
+HSA Agents
+==========
+*******
+Agent 1
+*******
+  Name:                    AMD Ryzen 7 5700X 8-Core Processor
+  Marketing Name:          AMD Ryzen 7 5700X 8-Core Processor
+  Vendor Name:             CPU
+  Device Type:             CPU
+  Pool Info:
+    Pool 1
+      Segment:                 GLOBAL; FLAGS: FINE GRAINED
+      Size:                    32768000(0x1f40000) KB
+*******
+Agent 2
+*******
+  Name:                    gfx1101
+  Marketing Name:          AMD Radeon RX 7800 XT
+  Vendor Name:             AMD
+  Device Type:             GPU
+  Cache Info:
+    L1:                      32(0x20) KB
+  Queue Max Size:          131072(0x20000)
+  Pool Info:
+    Pool 1
+      Segment:                 GLOBAL; FLAGS: COARSE GRAINED
+      Size:                    16760832(0xffc000) KB
+    Pool 2
+      Segment:                 KERNARG, FINE GRAINED
+      Size:                    16760832(0xffc000) KB
+  ISA Info:
+    ISA 1
+      Name:                    amdgcn-amd-amdhsa--gfx1101
+";
+
+    #[test]
+    fn rocminfo_output_normalizes_into_the_amd_class_vocabulary() {
+        // `Radeon` dropped and `(16GB)` spaced exactly as the live AMD class names are.
+        assert_eq!(
+            parse_rocminfo_gpu(ROCMINFO).as_deref(),
+            Some("AMD RX 7800 XT (16GB)")
+        );
+    }
+
+    /// The CPU agent's 32 GB GLOBAL pool precedes the GPU agent; reading it as VRAM
+    /// would invent an "AMD RX 7800 XT (32GB)" class that does not exist.
+    #[test]
+    fn rocminfo_cpu_agent_pools_never_masquerade_as_vram() {
+        assert!(!parse_rocminfo_gpu(ROCMINFO).unwrap().contains("32"));
+    }
+
+    #[test]
+    fn rocminfo_without_a_gpu_agent_or_without_pools_stays_honest() {
+        // CPU-only output (everything up to the GPU agent) → no GPU claimed.
+        let cpu_only = &ROCMINFO[..ROCMINFO.find("Agent 2").unwrap()];
+        assert_eq!(parse_rocminfo_gpu(cpu_only), None);
+        assert_eq!(parse_rocminfo_gpu(""), None);
+        assert_eq!(parse_rocminfo_gpu("rocminfo: command not found"), None);
+        // A GPU agent whose pools are missing keeps its name, without inventing a size.
+        let no_pools = "Marketing Name: Radeon RX 9060 XT\nDevice Type: GPU\n";
+        assert_eq!(
+            parse_rocminfo_gpu(no_pools).as_deref(),
+            Some("AMD RX 9060 XT")
+        );
     }
 
     #[test]
