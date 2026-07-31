@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use saladfingers_api::{GroupStatus, RetryPolicy, SaladClient, SaladClientConfig, Secret};
-use saladfingers_cli::deploy::{PollOptions, poll_until_running};
+use saladfingers_cli::deploy::{PollOptions, poll_until_running, resolve_gpu_uuids};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -67,5 +67,33 @@ async fn poll_reaches_running_through_transitions() {
         result.transitions.len() >= 2,
         "transitions: {:?}",
         result.transitions
+    );
+}
+
+/// A `--cpu-only` run names no GPU class, so it must not need the class list either.
+/// The server here answers 500 to everything: reaching it at all would fail a run that
+/// asked nothing about GPUs, which is what a cold cache plus a control-plane outage
+/// looks like from the operator's side.
+#[tokio::test]
+async fn a_cpu_only_run_never_asks_for_the_gpu_class_list() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    // `refresh: true`, so this stays red-capable on a developer machine: with
+    // `false`, a fresh on-disk gpu-classes cache (which any recent real run
+    // leaves behind) would satisfy the un-guarded code without a request, and
+    // the test would guard nothing outside the sandbox. The early return this
+    // pins comes before `refresh` is even consulted.
+    let uuids = resolve_gpu_uuids(&client(server.uri()), &[], true)
+        .await
+        .expect("no classes means no lookup");
+    assert!(uuids.is_empty());
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        0,
+        "resolving zero classes must not touch the API"
     );
 }

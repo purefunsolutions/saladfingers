@@ -253,6 +253,14 @@ pub struct RunArgs {
     /// Output `GLOB[:NAME]` to ship out.
     #[arg(long = "output")]
     pub outputs: Vec<String>,
+    /// Rent a CPU-only node: no GPU class is requested, so the group is placed
+    /// on whatever host has the vCPU and RAM.
+    ///
+    /// Opt-in rather than inferred from an omitted `--gpu-class`, because a
+    /// mistyped class name should fail loudly instead of quietly renting a
+    /// CPU box and running a CUDA workload on it.
+    #[arg(long, conflicts_with = "gpu_classes")]
+    pub cpu_only: bool,
     /// Publish a container port through the SaladCloud gateway — for watching a
     /// live training dashboard while the run trains.
     ///

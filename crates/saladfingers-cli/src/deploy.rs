@@ -31,6 +31,12 @@ pub async fn resolve_gpu_uuids(
     classes: &[String],
     refresh: bool,
 ) -> Result<Vec<String>> {
+    // A CPU-only request names no class, so it must not depend on the class list being
+    // fetchable: with a cold cache and the API down, `?` below would fail a run that
+    // asked nothing about GPUs.
+    if classes.is_empty() {
+        return Ok(Vec::new());
+    }
     let available = state::cached_gpu_classes(client, refresh, CACHE_TTL_HOURS).await?;
     let mut uuids = Vec::with_capacity(classes.len());
     for name in classes {
@@ -228,12 +234,18 @@ pub fn build_request(params: GroupParams) -> CreateContainerGroup {
         client_request_timeout: None,
         server_response_timeout: None,
     });
-    let mut resources = Resources::gpu(
-        params.cpu,
-        params.memory_mb,
-        params.gpu_uuids,
-        params.disk_gib,
-    );
+    let mut resources = if params.gpu_uuids.is_empty() {
+        // `--cpu-only`: say so at the call site rather than leaving a bare `vec![]`
+        // for a reader to interpret.
+        Resources::cpu_only(params.cpu, params.memory_mb, params.disk_gib)
+    } else {
+        Resources::gpu(
+            params.cpu,
+            params.memory_mb,
+            params.gpu_uuids,
+            params.disk_gib,
+        )
+    };
     resources.shm_size = params.shm_mb;
     CreateContainerGroup {
         name: params.name,
@@ -545,6 +557,22 @@ mod tests {
             body.get("networking").is_none(),
             "an unexposed run must not send a networking block: {body}"
         );
+    }
+
+    #[test]
+    fn no_gpu_uuids_serializes_as_an_empty_class_list_not_a_missing_field() {
+        // CPU-only (`run --cpu-only`). `gpu_classes` is required by the API,
+        // so it must appear as `[]` — dropping the field would be a different
+        // request, and one that fails at the far end rather than here.
+        let mut p = group_params(None);
+        p.gpu_uuids = Vec::new();
+        let req = build_request(p);
+        let body = serde_json::to_value(&req).unwrap();
+        let classes = &body["container"]["resources"]["gpu_classes"];
+        assert!(classes.is_array(), "gpu_classes must be present: {body}");
+        assert_eq!(classes.as_array().unwrap().len(), 0);
+        // The rest of the resource request is unchanged by dropping the GPU.
+        assert_eq!(body["container"]["resources"]["cpu"], 8);
     }
 
     #[test]

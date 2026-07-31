@@ -213,7 +213,14 @@ pub async fn run(cfg: Config, args: RunArgs) -> Result<()> {
         return Ok(());
     }
 
-    let hourly = deploy::gpu_hourly_price(&client, &params.gpu_classes[0], priority).await;
+    // `first()`, not `[0]`: a CPU-only run has no GPU class, and indexing here
+    // panicked AFTER the group was already created — leaving a live, billing
+    // group with no CLI attached to reap it. Cost estimation is advisory, so
+    // absent pricing is a `None`, never a failure.
+    let hourly = match params.gpu_classes.first() {
+        Some(class) => deploy::gpu_hourly_price(&client, class, priority).await,
+        None => None,
+    };
     let hard_cap = wait_hard_cap(params.max_duration_secs);
     let allowed_outputs: Vec<String> = params.outputs.iter().map(|o| o.name.clone()).collect();
     let exit_code = match await_and_collect(
@@ -1320,8 +1327,17 @@ fn resolve_params(cfg: &Config, profile: Option<&Profile>, args: &RunArgs) -> Re
     if gpu_classes.is_empty() {
         gpu_classes = profile.map(|p| p.gpu_classes.clone()).unwrap_or_default();
     }
-    if gpu_classes.is_empty() {
-        bail!("no GPU class (pass --gpu-class or set gpu_classes in the profile)");
+    // CPU-only is opt-IN rather than "no --gpu-class given". Inferring it from
+    // an omitted flag would turn a typo into a silent CPU rental that runs a
+    // CUDA workload to a confusing failure, or worse, a slow success.
+    //
+    // It beats a profile's `gpu_classes`, the way every other flag here does: clap has
+    // already refused `--cpu-only --gpu-class`, so the only classes that can still be
+    // here came from a profile the caller did not type on this command line.
+    if args.cpu_only {
+        gpu_classes.clear();
+    } else if gpu_classes.is_empty() {
+        bail!("no GPU class (pass --gpu-class, set gpu_classes in the profile, or --cpu-only)");
     }
     let priority = args
         .priority
@@ -1575,6 +1591,19 @@ mod tests {
         }
     }
 
+    /// [`run_args`] without a `--gpu-class`, for the paths where the absence of one is
+    /// the thing under test.
+    pub(super) fn run_args_no_class(extra: &[&str]) -> RunArgs {
+        let mut argv = vec!["saladfingers", "run", "--image", "example.invalid/img:t"];
+        argv.extend_from_slice(extra);
+        argv.extend_from_slice(&["--", "true"]);
+        use clap::Parser as _;
+        match crate::cli::Cli::parse_from(argv).command {
+            crate::cli::Command::Run(args) => args,
+            other => panic!("expected `run`, parsed {other:?}"),
+        }
+    }
+
     /// [`run_args`], but returning clap's error instead of exiting the process —
     /// for asserting a flag is REFUSED (`parse_from` exits on error).
     fn try_run_args(extra: &[&str]) -> Result<crate::cli::Cli, clap::Error> {
@@ -1674,6 +1703,58 @@ mod tests {
             run_args(&["--input-zstd-window-log", "27"]).input_zstd_window_log,
             Some(27)
         );
+    }
+
+    /// `--cpu-only` is a flag, so it beats a profile the way `--memory-gb` and
+    /// `--replicas` do. The ported version failed the run instead, with a message
+    /// naming `--gpu-class` — a flag the caller had not passed and could not withdraw,
+    /// because clap already refuses the two together.
+    #[test]
+    fn cpu_only_overrides_a_profiles_gpu_classes() {
+        let profile = Profile {
+            gpu_classes: vec!["rtx 4090 (24 gb)".into()],
+            ..Default::default()
+        };
+        let params = resolve_params(
+            &bare_config(),
+            Some(&profile),
+            &run_args_no_class(&["--cpu-only"]),
+        )
+        .expect("a CPU-only run must not be refused by a profile default");
+        assert!(params.gpu_classes.is_empty());
+
+        // Without the flag the profile still decides.
+        let params = resolve_params(&bare_config(), Some(&profile), &run_args_no_class(&[]))
+            .expect("resolve params");
+        assert_eq!(params.gpu_classes, vec!["rtx 4090 (24 gb)".to_string()]);
+    }
+
+    /// Naming both is a contradiction and dies at parse; naming neither is the mistake
+    /// `--cpu-only` exists to keep loud, since a mistyped class must not silently become
+    /// a CPU rental running a CUDA workload.
+    #[test]
+    fn cpu_only_and_gpu_class_are_mutually_exclusive_and_one_is_required() {
+        use clap::Parser as _;
+        let argv = [
+            "saladfingers",
+            "run",
+            "--image",
+            "example.invalid/img:t",
+            "--cpu-only",
+            "--gpu-class",
+            "rtx 4090 (24 gb)",
+            "--",
+            "true",
+        ];
+        assert!(
+            crate::cli::Cli::try_parse_from(argv).is_err(),
+            "--cpu-only with --gpu-class must be refused at parse"
+        );
+
+        let err = resolve_params(&bare_config(), None, &run_args_no_class(&[]))
+            .err()
+            .expect("neither a class nor --cpu-only");
+        assert!(format!("{err}").contains("--cpu-only"), "{err}");
     }
 
     /// The security invariant of `--expose-port`, end to end: the flag, through
