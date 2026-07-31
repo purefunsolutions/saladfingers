@@ -35,6 +35,9 @@ pub async fn up(cfg: Config, args: ServeUpArgs) -> Result<()> {
         args.image.as_deref(),
         profile.as_ref().and_then(|p| p.image.as_deref()),
     )?;
+    // Before any group is created: a service that cannot pull its own image should
+    // cost nothing — and it bills until something stops it.
+    deploy::check_registry_auth(&cfg, &image)?;
     let mut gpu_classes = args.gpu_classes.clone();
     if gpu_classes.is_empty() {
         gpu_classes = profile
@@ -106,6 +109,7 @@ pub async fn up(cfg: Config, args: ServeUpArgs) -> Result<()> {
         profile: args.profile.clone(),
         image: Some(image),
         gpu_classes: gpu_classes.clone(),
+        gpu_observed: None,
         priority: Some(priority_str),
         command: args.command.clone(),
         output_names: None,

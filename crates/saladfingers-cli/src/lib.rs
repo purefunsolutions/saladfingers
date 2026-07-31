@@ -26,6 +26,7 @@ pub mod serve;
 pub mod session;
 pub mod spec;
 pub mod state;
+pub mod tunnel;
 
 use anyhow::Result;
 
@@ -64,6 +65,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::Run(args) => runner::run(resolve()?, args).await,
         Command::Attach(args) => runner::attach(resolve()?, args).await,
+        Command::Tunnel(args) => tunnel::tunnel(resolve()?, args).await,
         Command::Ls(args) => admin::ls(resolve()?, args).await,
         Command::Status(args) => admin::status(resolve()?, args).await,
         Command::Watch(args) => admin::watch(resolve()?, args).await,

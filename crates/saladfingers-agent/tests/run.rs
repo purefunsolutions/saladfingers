@@ -326,3 +326,105 @@ async fn run_stops_reexecuting_a_failing_job_once_the_attempt_cap_is_spent() {
     assert_eq!(env["status"], "failed");
     assert_eq!(env["exit_code"], 3);
 }
+
+/// A run's output must survive as an artifact, not only as best-effort container stdout —
+/// and it must still reach stdout, because that is what `saladfingers logs` reads.
+///
+/// The script logs more lines than one log-entries page holds, which is the shape that lost
+/// its tail on sf-vf278i / sf-i1903a: the org log query is capped and node-clock stamped, so
+/// the uploaded copy is the one that can be trusted to be complete.
+#[tokio::test]
+async fn run_uploads_the_childs_complete_output_and_still_mirrors_it() {
+    let (base, store) = storage_server().await;
+    let http = reqwest::Client::new();
+    let work = tempfile::tempdir().unwrap();
+
+    let script = "i=0; while [ $i -lt 250 ]; do echo \"line $i\"; i=$((i+1)); done; \
+                  echo 'on-stderr' >&2; echo 'FINAL LINE'";
+    let job = json!({
+        "v": 1, "run_id": "sf-log001", "shard_index": 0, "shard_count": 1,
+        "command": ["sh", "-c", script],
+        "workdir": work.path().to_str().unwrap(),
+        "urls": {
+            "result_put": format!("{base}/result.json"), "result_get": format!("{base}/result.json"),
+            "attempts_put": format!("{base}/attempts.json"), "attempts_get": format!("{base}/attempts.json"),
+            "log_put": format!("{base}/log.txt")
+        }
+    });
+    http.put(format!("{base}/job.json"))
+        .body(serde_json::to_vec(&job).unwrap())
+        .send()
+        .await
+        .unwrap();
+
+    let output = spawn_agent(&format!("{base}/job.json")).await;
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let uploaded = store
+        .lock()
+        .unwrap()
+        .get("log.txt")
+        .cloned()
+        .expect("the agent uploaded the run's output");
+    let uploaded = String::from_utf8(uploaded).expect("utf-8 log");
+    assert!(uploaded.contains("line 0"), "the head is present");
+    assert!(uploaded.contains("line 249"), "past one page is present");
+    assert!(
+        uploaded.contains("FINAL LINE"),
+        "the tail is the whole point: {}",
+        uploaded
+            .lines()
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
+    assert!(uploaded.contains("on-stderr"), "stderr is captured too");
+
+    // Unchanged for the platform's log shipper: piping the child must not stop its output
+    // reaching the agent's own stdout, or `saladfingers logs --follow` goes dark.
+    let mirrored = String::from_utf8_lossy(&output.stdout);
+    assert!(mirrored.contains("line 0"));
+    assert!(mirrored.contains("FINAL LINE"));
+}
+
+/// The output of a run that *failed* is the most valuable thing it produced, so the upload
+/// must not be conditional on success the way the output artifacts are.
+#[tokio::test]
+async fn a_failed_run_still_uploads_its_output() {
+    let (base, store) = storage_server().await;
+    let http = reqwest::Client::new();
+    let work = tempfile::tempdir().unwrap();
+
+    let job = json!({
+        "v": 1, "run_id": "sf-log002", "shard_index": 0, "shard_count": 1,
+        "command": ["sh", "-c", "echo 'boom happened' >&2; exit 3"],
+        "workdir": work.path().to_str().unwrap(),
+        "urls": {
+            "result_put": format!("{base}/result.json"), "result_get": format!("{base}/result.json"),
+            "attempts_put": format!("{base}/attempts.json"), "attempts_get": format!("{base}/attempts.json"),
+            "log_put": format!("{base}/log.txt")
+        }
+    });
+    http.put(format!("{base}/job.json"))
+        .body(serde_json::to_vec(&job).unwrap())
+        .send()
+        .await
+        .unwrap();
+
+    let output = spawn_agent(&format!("{base}/job.json")).await;
+    assert_eq!(output.status.code(), Some(3));
+
+    let uploaded = store
+        .lock()
+        .unwrap()
+        .get("log.txt")
+        .cloned()
+        .expect("a failed run still uploads its output");
+    assert!(String::from_utf8_lossy(&uploaded).contains("boom happened"));
+}

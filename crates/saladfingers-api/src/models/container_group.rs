@@ -224,6 +224,10 @@ pub struct Resources {
     /// RAM in MB (≤ 61440 practical).
     pub memory: u32,
     /// GPU class UUIDs (multiple = first-available wins).
+    ///
+    /// **Empty means CPU-only**: the group is placed on whatever host can
+    /// supply the vCPU and RAM, with no GPU attached. Serialized as `[]`
+    /// rather than omitted — the field is required by the API.
     pub gpu_classes: Vec<String>,
     /// Minimum free disk in **bytes** (≥ 1 GiB).
     pub storage_amount: u64,
@@ -234,6 +238,10 @@ pub struct Resources {
 
 impl Resources {
     /// Build a GPU resource request, taking disk as GiB (converted to bytes).
+    ///
+    /// An empty `gpu_classes` is a CPU-only request; see [`Self::cpu_only`],
+    /// which says so at the call site instead of leaving a bare `vec![]` for
+    /// a reader to interpret.
     #[must_use]
     pub fn gpu(cpu: u32, memory_mb: u32, gpu_classes: Vec<String>, disk_gib: u64) -> Self {
         Self {
@@ -243,6 +251,13 @@ impl Resources {
             storage_amount: disk_gib.max(1) * GIB,
             shm_size: None,
         }
+    }
+
+    /// Build a CPU-only resource request — no GPU class, so placement is on
+    /// vCPU/RAM/disk alone.
+    #[must_use]
+    pub fn cpu_only(cpu: u32, memory_mb: u32, disk_gib: u64) -> Self {
+        Self::gpu(cpu, memory_mb, Vec::new(), disk_gib)
     }
 }
 

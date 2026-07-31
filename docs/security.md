@@ -18,6 +18,7 @@ the design and cannot be engineered away.
 | The SaladCloud control plane | **Yes** | Issues gateway URLs, schedules groups, is the billing authority. |
 | **The rented GPU node**, and the `sf-agent` running on it | **No** | Consumer hardware owned by strangers. It executes your command and can read anything inside the container. |
 | End users of `serve --proxy` | **No** | The gateway fronts it with `auth=false`; the app behind it enforces its own auth. |
+| Anything that can reach `saladfingers tunnel`'s loopback port | **Yes, by construction** | The tunnel attaches the operator's Salad API key to every forwarded request, so a local process reaching it acts with that key against that run's gateway. The listener is loopback-only and has no flag to widen it. |
 
 The load-bearing consequence: **no credential ever enters a container.** The agent
 receives presigned URLs, plus the instance-metadata JWT for S4 — never the SaladCloud API
@@ -36,6 +37,10 @@ So that the assumptions below are read in context, these are already handled in 
   cannot fill the collector's disk.
 - The `serve --proxy` reverse proxy targets a fixed loopback address, strips hop-by-hop
   headers, and does not follow upstream redirects.
+- `run --expose-port` creates the gateway with `auth=true`, so an exposed training
+  dashboard is never public, and `saladfingers tunnel` binds loopback only with no option
+  to widen it — a wider bind would re-publish that deliberately private port to the local
+  network, pre-authenticated with the operator's key.
 - The session API compares its bearer token in constant time and fails closed when the
   token is unset.
 - Local secrets are written owner-only at creation (0600 file, 0700 directory), and a

@@ -9,7 +9,10 @@ SPDX-License-Identifier: MIT OR Apache-2.0 OR BSD-3-Clause
 Bulk artifacts (datasets in, checkpoints/models out) move through any **S3-compatible**
 backend via presigned URLs. The agent only ever receives presigned URLs — never
 credentials, and never the Salad API key. Small control-plane objects (job specs,
-result envelopes, logs) can also use SaladCloud's S4 (100 MB/file, 30-day expiry).
+result envelopes, logs) can also use SaladCloud's S4 (100 MB/file, 30-day expiry). The
+agent's own complete copy of a run's container output lands at
+`runs/<run-id>/<shard>/log.txt`, which is what `saladfingers logs --uploaded` reads
+([run.md](run.md)).
 
 Directory artifacts travel as a `tar | zstd` stream split into ≤ 4 GiB parts
 (`<name>.tzst.000`, `.001`, …) behind ordinary presigned PUTs — portable across every

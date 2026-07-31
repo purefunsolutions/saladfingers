@@ -20,6 +20,13 @@ use clap::{Args, Parser, Subcommand};
 /// against $0.04/h for the 12 GB.
 pub const DEFAULT_PROBE_GPU_CLASS: &str = "RTX 3060 (8 GB)";
 
+/// Loopback port `saladfingers tunnel` listens on unless `--local-port` says otherwise.
+///
+/// Shared with `run --expose-port`'s "watch it with" hint, which prints the URL a browser
+/// should open: two literals would drift the moment either changed, and the hint would
+/// then send the operator to a port nothing is listening on.
+pub const DEFAULT_TUNNEL_PORT: u16 = 7777;
+
 /// Long help shared by every `--gpu-class` argument, so the resolution rules are
 /// stated once rather than repeated across the six commands that take one.
 ///
@@ -75,6 +82,14 @@ pub enum Command {
     Run(RunArgs),
     /// Re-attach to a detached run.
     Attach(RunIdArgs),
+    /// Open a loopback proxy onto a run's `--expose-port` gateway.
+    ///
+    /// The gateway is authenticated, so the exposed port is unreachable from
+    /// the public internet — and equally unreachable from a browser, which
+    /// cannot attach `Salad-Api-Key` to a navigation. This forwards
+    /// `http://127.0.0.1:LOCAL_PORT` to it with the key attached, streaming
+    /// responses so the dashboard's SSE survives. The key stays on this host.
+    Tunnel(TunnelArgs),
     /// List runs merged with their live group states.
     Ls(LsArgs),
     /// Show a run's status.
@@ -123,6 +138,19 @@ pub struct RunIdArgs {
     /// Emit JSON instead of a table.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct TunnelArgs {
+    /// Run identifier (e.g. `sf-x7k2mq`).
+    pub run_id: String,
+    /// Local loopback port to listen on.
+    #[arg(long, default_value_t = DEFAULT_TUNNEL_PORT, value_parser = clap::value_parser!(u16).range(1..=65535))]
+    pub local_port: u16,
+    /// Which shard's gateway to tunnel to (each shard is its own group, so
+    /// each has its own DNS name — per-instance routing is impossible).
+    #[arg(long, default_value_t = 0)]
+    pub shard: u32,
 }
 
 #[derive(Debug, Args)]
@@ -225,6 +253,27 @@ pub struct RunArgs {
     /// Output `GLOB[:NAME]` to ship out.
     #[arg(long = "output")]
     pub outputs: Vec<String>,
+    /// Rent a CPU-only node: no GPU class is requested, so the group is placed
+    /// on whatever host has the vCPU and RAM.
+    ///
+    /// Opt-in rather than inferred from an omitted `--gpu-class`, because a
+    /// mistyped class name should fail loudly instead of quietly renting a
+    /// CPU box and running a CUDA workload on it.
+    #[arg(long, conflicts_with = "gpu_classes")]
+    pub cpu_only: bool,
+    /// Publish a container port through the SaladCloud gateway — for watching a
+    /// live training dashboard while the run trains.
+    ///
+    /// The gateway is created with `auth=true`, so the port is NOT reachable
+    /// from the public internet: the Cloudflare edge rejects anything without
+    /// `Salad-Api-Key` before it reaches the container. A browser cannot send
+    /// that header, so reach it with `saladfingers tunnel RUN_ID`, which proxies
+    /// `http://127.0.0.1:7777` to the gateway with the key attached.
+    ///
+    /// The process in the container must listen on IPv6 `[::]`; the gateway
+    /// answers 503 for one bound only to `0.0.0.0` or to loopback.
+    #[arg(long, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..=65535))]
+    pub expose_port: Option<u16>,
     /// Priority tier.
     #[arg(long)]
     pub priority: Option<String>,
@@ -274,8 +323,30 @@ pub struct LogsArgs {
     /// Run identifier.
     pub run_id: String,
     /// Follow the log stream.
+    ///
+    /// Tails a rolling window of its own, so it takes neither `--since`, `--limit`,
+    /// nor `--all` — they are refused rather than silently ignored.
     #[arg(long)]
     pub follow: bool,
+    /// Print at most this many entries per group, keeping the newest.
+    #[arg(long, default_value_t = 1000, conflicts_with = "follow")]
+    pub limit: usize,
+    /// Print every entry in the window (no `--limit` cap).
+    #[arg(long, conflicts_with = "follow")]
+    pub all: bool,
+    /// How far back to search (e.g. `90m`, `6h`).
+    #[arg(long, default_value = "24h", conflicts_with = "follow")]
+    pub since: String,
+    /// Print the complete copy the agent uploaded to storage instead of querying the
+    /// platform's log service.
+    #[arg(long, conflicts_with = "follow")]
+    pub uploaded: bool,
+    /// Shard whose uploaded output to print.
+    ///
+    /// Only meaningful with `--uploaded`, which addresses one shard's storage key;
+    /// the platform query covers every shard's group at once.
+    #[arg(long, default_value_t = 0, requires = "uploaded")]
+    pub shard: u32,
 }
 
 #[derive(Debug, Args)]

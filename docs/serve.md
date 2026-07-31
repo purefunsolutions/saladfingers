@@ -6,9 +6,12 @@ SPDX-License-Identifier: MIT OR Apache-2.0 OR BSD-3-Clause
 
 # Interactive sessions and inference serving
 
-Beyond one-shot `run`, saladfingers has two long-lived modes, both driven by the
-in-container agent's HTTP API (`sf-agent serve`) through the SaladCloud gateway. Both
-self-stop when idle so a forgotten box never bills indefinitely.
+Beyond one-shot `run` ([run.md](run.md)), saladfingers has two long-lived modes, both
+driven by the in-container agent's HTTP API (`sf-agent serve`) through the SaladCloud
+gateway. Both self-stop when idle so a forgotten box never bills indefinitely. A one-shot
+run can be reached over the gateway too — `run --expose-port` plus `saladfingers tunnel` —
+but that path is `auth=true` and lives only as long as the run; these two are the
+long-lived, name-stable ones.
 
 ## `session` — an interactive GPU dev box
 
@@ -78,5 +81,7 @@ scale by bringing up several.
 The SaladCloud gateway caps requests at **100 s** and **1 GB**. So: exec output is
 long-polled in ≤ 30 s waits, files move in bounded chunks, and the proxy streams
 responses rather than buffering them. WebSockets require `auth=false` and are avoided in
-v1 in favour of long-poll. Bind the app to loopback (`127.0.0.1:<app-port>`); the agent
-owns the IPv6 `[::]` gateway socket.
+v1 in favour of long-poll. Under `serve --proxy`, bind the app to loopback
+(`127.0.0.1:<app-port>`) — the agent owns the IPv6 `[::]` gateway socket. With
+`run --expose-port` there is no proxy, so the process itself must bind `[::]`
+([run.md](run.md)).

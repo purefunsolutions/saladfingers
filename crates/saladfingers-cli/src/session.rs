@@ -21,6 +21,7 @@ use base64::Engine;
 use chrono::Utc;
 use reqwest::Method;
 use saladfingers_api::{RestartPolicy, SaladClient};
+use saladfingers_protocol::GpuVendor;
 use saladfingers_protocol::agent_api::{
     self, ExecCreated, ExecRequest, FileStat, Health, OutputPage, UploadInit, UploadInitResponse,
     UploadStatus,
@@ -56,6 +57,9 @@ pub async fn create(cfg: Config, args: SessionCreateArgs) -> Result<()> {
         args.image.as_deref(),
         profile.as_ref().and_then(|p| p.image.as_deref()),
     )?;
+    // Before any group is created: a session that cannot pull its own image should
+    // cost nothing — and it bills for as long as it is left up, not for one job.
+    deploy::check_registry_auth(&cfg, &image)?;
     let mut gpu_classes = args.gpu_classes.clone();
     if gpu_classes.is_empty() {
         gpu_classes = profile
@@ -82,7 +86,11 @@ pub async fn create(cfg: Config, args: SessionCreateArgs) -> Result<()> {
         .with_context(|| format!("invalid --max-duration {:?}", args.max_duration))?
         .as_secs();
 
-    let uuids = deploy::resolve_gpu_uuids(&client, &gpu_classes, false).await?;
+    let resolved = deploy::resolve_gpu_classes(&client, &gpu_classes, false).await?;
+    // Decided from the CANONICAL class names, so a class requested by raw UUID still
+    // classifies — the caller-typed strings could not answer for one.
+    let vendor = vendor_hint(resolved.iter().map(|c| c.name.as_str()));
+    let uuids = resolved.into_iter().map(|c| c.id).collect();
     let mut env = profile.as_ref().map(|p| p.env.clone()).unwrap_or_default();
     env.insert("SF_AGENT_TOKEN".into(), token.clone());
     env.insert("SF_PORT".into(), AGENT_PORT.to_string());
@@ -120,6 +128,7 @@ pub async fn create(cfg: Config, args: SessionCreateArgs) -> Result<()> {
         profile: args.profile.clone(),
         image: Some(image),
         gpu_classes: gpu_classes.clone(),
+        gpu_observed: None,
         priority: Some(priority_str),
         command: vec![],
         output_names: None,
@@ -162,6 +171,10 @@ pub async fn create(cfg: Config, args: SessionCreateArgs) -> Result<()> {
     if let Some(g) = run.groups.first_mut() {
         g.last_state = Some("running".into());
     }
+    // Record which GPU this actually landed on, while the agent is connected and the box
+    // is alive: SaladCloud will never tell us (see `RunState::gpu_observed`), and once the
+    // group is deleted there is nothing left to ask.
+    run.gpu_observed = observe_gpu(&agent, vendor).await;
     state::save_run(&run)?;
 
     // Self-exit does not stop billing (the platform relaunches the container on every
@@ -277,12 +290,219 @@ pub async fn ls(_cfg: Config, args: ReadArgs) -> Result<()> {
         t.add_row(vec![
             s.run_id.clone(),
             s.status.clone(),
-            s.gpu_classes.first().cloned().unwrap_or_default(),
+            gpu_cell(s),
             s.created_at.format("%Y-%m-%d %H:%M").to_string(),
         ]);
     }
     println!("{t}");
     Ok(())
+}
+
+/// What the `gpu` column may honestly claim about a session.
+///
+/// Printing `gpu_classes.first()` was wrong whenever the request was a first-available
+/// list: `--gpu-class A --gpu-class B` renders as `A` on a box that is really a `B`, and
+/// the operator has no way to tell. A single requested class is safe (the placement can
+/// only have been that one); several are not, so say so rather than pick.
+fn gpu_cell(s: &state::RunState) -> String {
+    if let Some(observed) = &s.gpu_observed {
+        return observed.clone();
+    }
+    match s.gpu_classes.as_slice() {
+        [] => String::new(),
+        [only] => only.clone(),
+        many => format!("? (1 of {} requested)", many.len()),
+    }
+}
+
+/// Which vendor's query tool the requested classes say the node will answer to.
+///
+/// SaladCloud's live class list spells every AMD class with an `AMD` prefix and no
+/// NVIDIA class with one, so the canonical names decide without another API call.
+/// `None` means the request itself does not decide — a list mixing vendors — and the
+/// observer must try both.
+fn vendor_hint<'a>(names: impl Iterator<Item = &'a str>) -> Option<GpuVendor> {
+    let mut saw = (false, false); // (amd, nvidia)
+    for name in names {
+        // "May contain leading whitespace" — the GpuClass field's own doc.
+        if name.trim_start().to_ascii_lowercase().starts_with("amd") {
+            saw.0 = true;
+        } else {
+            saw.1 = true;
+        }
+    }
+    match saw {
+        (true, false) => Some(GpuVendor::Amd),
+        (false, true) => Some(GpuVendor::Nvidia),
+        _ => None,
+    }
+}
+
+/// Ask the node what GPU it actually has, for [`state::RunState::gpu_observed`].
+///
+/// `vendor` (from [`vendor_hint`]) picks the tool, because the two are asymmetric and
+/// each is the only one its node can answer: the host injects `nvidia-smi` into every
+/// container on an NVIDIA node (even an image with no CUDA layer), while Salad's AMD
+/// nodes are WSL2 and inject no ROCm userspace at all ([empirical.md] E13) — there
+/// `rocminfo` exists exactly when the image baked the `rocm-runtime` flavor, which is
+/// exactly when the session could run GPU work in the first place. An undecided hint
+/// (mixed-vendor request) tries both, NVIDIA first.
+///
+/// Best effort by construction: the caller has a working session and must not lose it
+/// over a table column, so every failure — the tool absent, an exec the agent refuses,
+/// unparsable output — returns `None` and leaves the honest fallback in [`gpu_cell`]
+/// to explain itself.
+async fn observe_gpu(agent: &AgentClient, vendor: Option<GpuVendor>) -> Option<String> {
+    if vendor != Some(GpuVendor::Amd) {
+        if let Ok(out) = exec_capture(
+            agent,
+            vec![
+                "nvidia-smi".into(),
+                "--query-gpu=name,memory.total".into(),
+                "--format=csv,noheader".into(),
+            ],
+        )
+        .await
+            && let Some(gpu) = parse_smi_gpu(&out)
+        {
+            return Some(gpu);
+        }
+        if vendor == Some(GpuVendor::Nvidia) {
+            return None;
+        }
+    }
+    let out = exec_capture(agent, vec!["rocminfo".into()]).await.ok()?;
+    parse_rocminfo_gpu(&out)
+}
+
+/// `NVIDIA GeForce RTX 2060, 12288 MiB` → `RTX 2060 (12 GB)`.
+///
+/// Normalized into the vocabulary `gpu-classes` uses, so the column reads the same
+/// whether the value was observed or echoed from the request. The VRAM matters: it is
+/// what distinguishes the near-duplicate classes (`RTX 3060 (8 GB)` vs `(12 GB)`).
+fn parse_smi_gpu(out: &str) -> Option<String> {
+    let line = out.lines().find(|l| !l.trim().is_empty())?;
+    let (name, mem) = line.split_once(',')?;
+    let name = name
+        .trim()
+        .trim_start_matches("NVIDIA GeForce ")
+        .trim_start_matches("NVIDIA ")
+        .trim();
+    if name.is_empty() {
+        return None;
+    }
+    let mib: u64 = mem.split_whitespace().next()?.parse().ok()?;
+    // Round to the nearest GB: cards report a usable 12288/8192 MiB, and the class names
+    // are written in whole GB.
+    Some(format!("{name} ({} GB)", mib.div_ceil(1024)))
+}
+
+/// `rocminfo` output → `AMD RX 7800 XT (16GB)`.
+///
+/// rocminfo lists the CPU agent(s) first, so the name is the `Marketing Name:` of the
+/// agent whose `Device Type:` is `GPU` — the same walk the probe's report does — and the
+/// VRAM is that agent's largest `GLOBAL` pool. Normalized into the vocabulary the live
+/// class list uses for AMD: `Radeon` dropped, an `AMD` prefix, and the size written
+/// `(16GB)` without the space the NVIDIA names carry, because that is how SaladCloud
+/// spells its AMD classes. A GPU whose pools do not parse keeps its bare name — better a
+/// size-less truth than an invented one.
+fn parse_rocminfo_gpu(out: &str) -> Option<String> {
+    let mut last_marketing: Option<&str> = None;
+    let mut gpu_name: Option<&str> = None;
+    let mut in_global_pool = false;
+    let mut vram_kib: u64 = 0;
+    for line in out.lines() {
+        let t = line.trim();
+        if let Some(name) = t.strip_prefix("Marketing Name:") {
+            if gpu_name.is_some() {
+                break; // the agent after the GPU — its pools must not count
+            }
+            last_marketing = Some(name.trim());
+        } else if t.starts_with("Device Type:") && t.contains("GPU") {
+            gpu_name = last_marketing;
+        } else if gpu_name.is_some() {
+            if let Some(seg) = t.strip_prefix("Segment:") {
+                in_global_pool = seg.contains("GLOBAL");
+            } else if in_global_pool
+                && let Some(size) = t.strip_prefix("Size:")
+                && let Some(kib) = size
+                    .trim()
+                    .strip_suffix("KB")
+                    .and_then(|s| s.split('(').next())
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+            {
+                vram_kib = vram_kib.max(kib);
+            }
+        }
+    }
+    let name = gpu_name?.replacen("Radeon ", "", 1);
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let name = if name.starts_with("AMD") {
+        name.to_string()
+    } else {
+        format!("AMD {name}")
+    };
+    if vram_kib == 0 {
+        return Some(name);
+    }
+    Some(format!(
+        "{name} ({}GB)",
+        vram_kib.div_ceil(1024).div_ceil(1024)
+    ))
+}
+
+/// Run one command in a session and collect its stdout.
+///
+/// The streaming [`exec`] path writes straight to this process's stdout and exits with
+/// the remote code, which is right for an interactive command and useless for a caller
+/// that wants the bytes back.
+async fn exec_capture(agent: &AgentClient, argv: Vec<String>) -> Result<String> {
+    let created: ExecCreated = agent
+        .json(
+            Method::POST,
+            agent_api::route::EXEC,
+            Some(&ExecRequest {
+                argv,
+                workdir: None,
+                env: None,
+            }),
+        )
+        .await
+        .context("starting exec")?;
+
+    let mut out = String::new();
+    let mut cursor = 0u64;
+    // Bounded rather than `loop`: a command that never exits must not hang the caller
+    // (here, `session create`) forever.
+    for _ in 0..8 {
+        let page: OutputPage = agent
+            .json::<(), _>(
+                Method::GET,
+                &format!(
+                    "{}?cursor={cursor}&wait_ms={OUTPUT_WAIT_MS}",
+                    agent_api::route::exec_output(&created.exec_id)
+                ),
+                None,
+            )
+            .await
+            .context("polling exec output")?;
+        for chunk in &page.chunks {
+            if matches!(chunk.stream, agent_api::Stream::Stdout) {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&chunk.data_b64)
+                    .unwrap_or_default();
+                out.push_str(&String::from_utf8_lossy(&bytes));
+            }
+        }
+        cursor = page.next_cursor;
+        if page.exited {
+            return Ok(out);
+        }
+    }
+    bail!("exec did not finish")
 }
 
 /// `saladfingers session logs NAME [EXEC]`
@@ -326,6 +546,13 @@ async fn logs_via_container(cfg: Config, name: &str) -> Result<()> {
         crate::cli::LogsArgs {
             run_id: name.to_string(),
             follow: false,
+            limit: 1000,
+            all: false,
+            since: "24h".to_string(),
+            // A session's output lives in the agent's exec ring, not a batch run's uploaded
+            // capture; this fallback is specifically the container-stdout view.
+            uploaded: false,
+            shard: 0,
         },
     )
     .await
@@ -716,6 +943,174 @@ fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn session_state(gpu_classes: &[&str], observed: Option<&str>) -> state::RunState {
+        state::RunState {
+            v: 1,
+            run_id: "sf-x7k2mq".into(),
+            kind: "session".into(),
+            created_at: Utc::now(),
+            org: "my-org".into(),
+            project: "my-proj".into(),
+            profile: None,
+            image: Some("img@sha256:abc".into()),
+            gpu_classes: gpu_classes.iter().map(|s| (*s).to_string()).collect(),
+            gpu_observed: observed.map(str::to_string),
+            priority: Some("batch".into()),
+            command: vec![],
+            output_names: None,
+            max_parts: None,
+            groups: vec![],
+            status: "running".into(),
+            agent_token: None,
+            max_duration_secs: None,
+            result: None,
+        }
+    }
+
+    /// The bug this replaced: a first-available list rendered its FIRST entry as though
+    /// it were the allocation. Measured live — `--gpu-class 'GTX 1650 (4 GB)'` first, on
+    /// a box that was really an RTX 2060 — and the column said `GTX 1650 (4 GB)`.
+    #[test]
+    fn the_gpu_column_never_names_a_card_the_placement_may_not_have_used() {
+        let many = session_state(&["GTX 1650 (4 GB)", "RTX 2060 (6 GB)"], None);
+        let cell = gpu_cell(&many);
+        assert!(!cell.contains("GTX 1650"), "{cell}");
+        assert_eq!(cell, "? (1 of 2 requested)");
+    }
+
+    /// One requested class needs no hedging: the placement can only have been that one.
+    #[test]
+    fn a_single_requested_class_is_reported_plainly() {
+        assert_eq!(
+            gpu_cell(&session_state(&["RTX 3060 (12 GB)"], None)),
+            "RTX 3060 (12 GB)"
+        );
+        assert_eq!(gpu_cell(&session_state(&[], None)), "");
+    }
+
+    /// Once the node has been asked, its answer wins over any request.
+    #[test]
+    fn an_observed_gpu_beats_the_requested_list() {
+        let s = session_state(
+            &["GTX 1650 (4 GB)", "RTX 2060 (6 GB)"],
+            Some("RTX 2060 (12 GB)"),
+        );
+        assert_eq!(gpu_cell(&s), "RTX 2060 (12 GB)");
+    }
+
+    #[test]
+    fn smi_output_normalizes_into_the_gpu_class_vocabulary() {
+        assert_eq!(
+            parse_smi_gpu("NVIDIA GeForce RTX 2060, 12288 MiB\n").as_deref(),
+            Some("RTX 2060 (12 GB)")
+        );
+        assert_eq!(
+            parse_smi_gpu("NVIDIA GeForce GTX 1650, 4096 MiB").as_deref(),
+            Some("GTX 1650 (4 GB)")
+        );
+        // A card reporting slightly under a whole GB still names its marketed size —
+        // 11264 MiB is an "11 GB" 2080 Ti, and rounding down would invent a 10 GB class.
+        assert_eq!(
+            parse_smi_gpu("NVIDIA GeForce RTX 2080 Ti, 11000 MiB").as_deref(),
+            Some("RTX 2080 Ti (11 GB)")
+        );
+        // Anything unparsable is None, never a half-formed label.
+        assert_eq!(parse_smi_gpu(""), None);
+        assert_eq!(parse_smi_gpu("no such command"), None);
+        assert_eq!(parse_smi_gpu("NVIDIA GeForce RTX 2060, [N/A]"), None);
+    }
+
+    /// The requested classes decide which vendor's tool the observer runs — from the
+    /// CANONICAL names (a raw-UUID request resolves to one before this), and matching
+    /// how the live class list is spelled: every AMD class is `AMD`-prefixed, no NVIDIA
+    /// class is. A mixed request decides nothing and the observer tries both.
+    #[test]
+    fn the_requested_classes_pick_the_query_tool() {
+        let hint = |names: &[&str]| vendor_hint(names.iter().copied());
+        assert_eq!(
+            hint(&["AMD RX 7800 XT (16GB)", "AMD RX 9060 XT (16GB)"]),
+            Some(GpuVendor::Amd)
+        );
+        assert_eq!(
+            hint(&["GTX 1650 (4 GB)", "RTX 3060 (12 GB)"]),
+            Some(GpuVendor::Nvidia)
+        );
+        assert_eq!(hint(&["RTX 3060 (12 GB)", "AMD RX 7800 XT (16GB)"]), None);
+        assert_eq!(hint(&[]), None);
+        // The class list's documented quirk: names may carry leading whitespace.
+        assert_eq!(hint(&["  AMD RX 7800 XT (16GB)"]), Some(GpuVendor::Amd));
+    }
+
+    /// The shape rocminfo actually prints: CPU agent first (whose GLOBAL pool is host
+    /// RAM and must NOT be read as VRAM), then the GPU agent with its pools.
+    const ROCMINFO: &str = "\
+==========
+HSA Agents
+==========
+*******
+Agent 1
+*******
+  Name:                    AMD Ryzen 7 5700X 8-Core Processor
+  Marketing Name:          AMD Ryzen 7 5700X 8-Core Processor
+  Vendor Name:             CPU
+  Device Type:             CPU
+  Pool Info:
+    Pool 1
+      Segment:                 GLOBAL; FLAGS: FINE GRAINED
+      Size:                    32768000(0x1f40000) KB
+*******
+Agent 2
+*******
+  Name:                    gfx1101
+  Marketing Name:          AMD Radeon RX 7800 XT
+  Vendor Name:             AMD
+  Device Type:             GPU
+  Cache Info:
+    L1:                      32(0x20) KB
+  Queue Max Size:          131072(0x20000)
+  Pool Info:
+    Pool 1
+      Segment:                 GLOBAL; FLAGS: COARSE GRAINED
+      Size:                    16760832(0xffc000) KB
+    Pool 2
+      Segment:                 KERNARG, FINE GRAINED
+      Size:                    16760832(0xffc000) KB
+  ISA Info:
+    ISA 1
+      Name:                    amdgcn-amd-amdhsa--gfx1101
+";
+
+    #[test]
+    fn rocminfo_output_normalizes_into_the_amd_class_vocabulary() {
+        // `Radeon` dropped and `(16GB)` spaced exactly as the live AMD class names are.
+        assert_eq!(
+            parse_rocminfo_gpu(ROCMINFO).as_deref(),
+            Some("AMD RX 7800 XT (16GB)")
+        );
+    }
+
+    /// The CPU agent's 32 GB GLOBAL pool precedes the GPU agent; reading it as VRAM
+    /// would invent an "AMD RX 7800 XT (32GB)" class that does not exist.
+    #[test]
+    fn rocminfo_cpu_agent_pools_never_masquerade_as_vram() {
+        assert!(!parse_rocminfo_gpu(ROCMINFO).unwrap().contains("32"));
+    }
+
+    #[test]
+    fn rocminfo_without_a_gpu_agent_or_without_pools_stays_honest() {
+        // CPU-only output (everything up to the GPU agent) → no GPU claimed.
+        let cpu_only = &ROCMINFO[..ROCMINFO.find("Agent 2").unwrap()];
+        assert_eq!(parse_rocminfo_gpu(cpu_only), None);
+        assert_eq!(parse_rocminfo_gpu(""), None);
+        assert_eq!(parse_rocminfo_gpu("rocminfo: command not found"), None);
+        // A GPU agent whose pools are missing keeps its name, without inventing a size.
+        let no_pools = "Marketing Name: Radeon RX 9060 XT\nDevice Type: GPU\n";
+        assert_eq!(
+            parse_rocminfo_gpu(no_pools).as_deref(),
+            Some("AMD RX 9060 XT")
+        );
+    }
 
     #[test]
     fn parse_remote_distinguishes_sessions_from_local_paths() {

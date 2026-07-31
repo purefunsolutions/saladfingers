@@ -54,6 +54,9 @@ struct RunParams {
     gate: Option<GateParams>,
     checkpoint: Option<CheckpointParams>,
     name_hint: Option<String>,
+    /// Container port to publish through the gateway, or `None` for no gateway
+    /// — the default, and what every run did before `--expose-port` existed.
+    expose_port: Option<u16>,
 }
 
 /// `saladfingers run`
@@ -65,6 +68,9 @@ pub async fn run(cfg: Config, args: RunArgs) -> Result<()> {
         .transpose()?
         .cloned();
     let params = resolve_params(&cfg, profile.as_ref(), &args)?;
+    // Before anything is uploaded or any group is created: a run that cannot pull
+    // its own image should cost nothing.
+    deploy::check_registry_auth(&cfg, &params.image)?;
     let storage = cfg
         .storage
         .as_ref()
@@ -150,23 +156,14 @@ pub async fn run(cfg: Config, args: RunArgs) -> Result<()> {
 
         let env = job_env(&job_url, &run_id, shard, shard_count, job_sha256)?;
 
-        let request = deploy::build_request(GroupParams {
-            name: name.clone(),
-            image: params.image.clone(),
-            gpu_uuids: uuids.clone(),
+        let request = deploy::build_request(shard_group_params(
+            &cfg,
+            &params,
+            name.clone(),
+            uuids.clone(),
             priority,
-            cpu: params.cpu,
-            memory_mb: params.memory_mb,
-            disk_gib: params.disk_gib,
-            command: Some(vec!["/bin/sf-agent".into(), "run".into()]),
             env,
-            gateway_port: None,
-            gateway_auth: false,
-            registry_auth: deploy::registry_auth(&cfg),
-            restart_policy: RestartPolicy::OnFailure,
-            country_codes: params.country_codes.clone(),
-            shm_mb: params.shm_mb,
-        });
+        ));
         eprintln!("run {run_id}: creating shard {shard} ({name})...");
         if let Err(e) = client.create_container_group(&request).await {
             // A mid-loop failure must not leak the shards already created — each is a
@@ -192,6 +189,10 @@ pub async fn run(cfg: Config, args: RunArgs) -> Result<()> {
         });
     }
 
+    if params.expose_port.is_some() {
+        report_gateways(&client, &run_id, &groups).await;
+    }
+
     save_state(&cfg, &run_id, &params, &groups, "running");
 
     if args.detach {
@@ -212,7 +213,14 @@ pub async fn run(cfg: Config, args: RunArgs) -> Result<()> {
         return Ok(());
     }
 
-    let hourly = deploy::gpu_hourly_price(&client, &params.gpu_classes[0], priority).await;
+    // `first()`, not `[0]`: a CPU-only run has no GPU class, and indexing here
+    // panicked AFTER the group was already created — leaving a live, billing
+    // group with no CLI attached to reap it. Cost estimation is advisory, so
+    // absent pricing is a `None`, never a failure.
+    let hourly = match params.gpu_classes.first() {
+        Some(class) => deploy::gpu_hourly_price(&client, class, priority).await,
+        None => None,
+    };
     let hard_cap = wait_hard_cap(params.max_duration_secs);
     let allowed_outputs: Vec<String> = params.outputs.iter().map(|o| o.name.clone()).collect();
     let exit_code = match await_and_collect(
@@ -615,7 +623,7 @@ async fn await_and_collect(
             ShardOutcome::Failed => {
                 worst = worst.max(1);
                 eprintln!("  shard {shard}: group failed (no envelope) — keeping it for forensics");
-                print_system_logs(client, &name).await;
+                print_failure_reason(client, &name).await;
             }
             ShardOutcome::Vanished => {
                 worst = worst.max(1);
@@ -845,6 +853,69 @@ fn running_machine_id(instances: &[Instance]) -> Option<String> {
         .and_then(|i| i.machine_id.clone())
 }
 
+/// How long to wait for the control plane to publish a group's gateway DNS
+/// name. It is static per group and normally present on the create response,
+/// but it has been observed a poll or two late, and a URL printed after the
+/// scrolling status lines is a URL nobody sees.
+const GATEWAY_TRIES: u32 = 5;
+const GATEWAY_RETRY: Duration = Duration::from_secs(3);
+
+/// Print the public gateway URL of every group in the run.
+///
+/// Best-effort by construction: the groups are already created and billing, so
+/// a control-plane hiccup here must never fail the run — the worst outcome is
+/// a run that trains fine without a clickable link.
+async fn report_gateways(client: &SaladClient, run_id: &str, groups: &[GroupRef]) {
+    for g in groups {
+        let mut url = None;
+        for attempt in 0..GATEWAY_TRIES {
+            match client.get_container_group(&g.name).await {
+                Ok(group) => {
+                    if let Some(u) = group.gateway_url() {
+                        url = Some(u);
+                        break;
+                    }
+                }
+                Err(e) => tracing::warn!("gateway lookup for {} failed: {e:#}", g.name),
+            }
+            if attempt + 1 < GATEWAY_TRIES {
+                tokio::time::sleep(GATEWAY_RETRY).await;
+            }
+        }
+        match url {
+            Some(u) => eprintln!("{}", watch_hint(run_id, g.shard, &u)),
+            None => eprintln!(
+                "run {run_id}: shard {} requested a gateway but no URL is published yet; \
+                 re-check with `saladfingers status {run_id}`",
+                g.shard
+            ),
+        }
+    }
+}
+
+/// What to tell the operator about an exposed shard.
+///
+/// Deliberately NOT "open this URL": the gateway is authenticated, so pasting it into a
+/// browser returns 403. Print the command that actually works, and the loopback URL that
+/// command will serve on — from [`tunnel::browser_url`] and the same default the
+/// `--local-port` flag carries, so the advice cannot drift from the tool. Also say it
+/// answers only once the instance is up: the image still has to pull, and a 503 on the
+/// first try reads as a broken feature.
+fn watch_hint(run_id: &str, shard: u32, url: &str) -> String {
+    let shard_flag = if shard == 0 {
+        String::new()
+    } else {
+        format!(" --shard {shard}")
+    };
+    format!(
+        "run {run_id}: shard {shard} exposed at {url} (authenticated — a browser gets 403)\n  \
+         watch it with:  saladfingers tunnel {run_id}{shard_flag}\n  \
+         then open {}\n  \
+         (serves once the instance reaches `running`; 503 until then)",
+        crate::tunnel::browser_url(crate::cli::DEFAULT_TUNNEL_PORT)
+    )
+}
+
 async fn await_shard(
     client: &SaladClient,
     http: &reqwest::Client,
@@ -1071,6 +1142,27 @@ async fn cleanup(client: &SaladClient, run_id: &str, shard_count: u32) {
     }
 }
 
+/// Everything the control plane will say about why a group failed.
+///
+/// `current_state.description` comes first because it is usually the entire
+/// answer and nothing else surfaces it. A group that fails before its container
+/// ever starts — an image the node could not pull, say — has no system log
+/// entries and no envelope, so without this the CLI reports "group failed (no
+/// envelope)" and the actual reason ("Access Denied, Check Permissions") is
+/// reachable only by hand-querying the API. That happened, and it cost a run
+/// plus a long detour to diagnose.
+async fn print_failure_reason(client: &SaladClient, name: &str) {
+    if let Ok(group) = client.get_container_group(name).await
+        && let Some(description) = group
+            .current_state
+            .as_ref()
+            .and_then(|s| s.description.as_deref())
+    {
+        eprintln!("    reason: {description}");
+    }
+    print_system_logs(client, name).await;
+}
+
 async fn print_system_logs(client: &SaladClient, name: &str) {
     if let Ok(entries) = client.get_system_logs(name).await {
         for entry in entries.iter().take(10) {
@@ -1182,6 +1274,50 @@ fn memory_mb(gib: Option<u32>) -> Result<u32> {
     })
 }
 
+/// The group request for one shard.
+///
+/// Extracted from `run`'s create loop so `gateway_auth` is reachable from a test. The
+/// value is a security decision, not a parameter: `run --expose-port` publishes a port
+/// on a machine someone else owns, and `auth=false` there would put a live training
+/// dashboard in front of anyone who learns the DNS name.
+fn shard_group_params(
+    cfg: &Config,
+    params: &RunParams,
+    name: String,
+    gpu_uuids: Vec<String>,
+    priority: saladfingers_api::ContainerPriority,
+    env: BTreeMap<String, String>,
+) -> GroupParams {
+    GroupParams {
+        name,
+        image: params.image.clone(),
+        gpu_uuids,
+        priority,
+        cpu: params.cpu,
+        memory_mb: params.memory_mb,
+        disk_gib: params.disk_gib,
+        command: Some(vec!["/bin/sf-agent".into(), "run".into()]),
+        env,
+        gateway_port: params.expose_port,
+        // AUTHENTICATED, so the exposed port is never reachable from the
+        // public internet: unauthenticated traffic is rejected at the
+        // Cloudflare edge and never reaches the container at all.
+        //
+        // A browser cannot attach `Salad-Api-Key` to a navigation, so the
+        // caller runs `saladfingers tunnel`, a loopback proxy that injects
+        // it, and points the browser at 127.0.0.1. Same trust model as
+        // `session`/`probe`; the key never leaves the caller's host.
+        //
+        // `auth=false` would save the tunnel and publish a live training
+        // dashboard to anyone who learns the DNS name.
+        gateway_auth: true,
+        registry_auth: deploy::registry_auth(cfg),
+        restart_policy: RestartPolicy::OnFailure,
+        country_codes: params.country_codes.clone(),
+        shm_mb: params.shm_mb,
+    }
+}
+
 fn resolve_params(cfg: &Config, profile: Option<&Profile>, args: &RunArgs) -> Result<RunParams> {
     let image = crate::image::resolve_deploy_image(
         args.image.as_deref(),
@@ -1191,8 +1327,17 @@ fn resolve_params(cfg: &Config, profile: Option<&Profile>, args: &RunArgs) -> Re
     if gpu_classes.is_empty() {
         gpu_classes = profile.map(|p| p.gpu_classes.clone()).unwrap_or_default();
     }
-    if gpu_classes.is_empty() {
-        bail!("no GPU class (pass --gpu-class or set gpu_classes in the profile)");
+    // CPU-only is opt-IN rather than "no --gpu-class given". Inferring it from
+    // an omitted flag would turn a typo into a silent CPU rental that runs a
+    // CUDA workload to a confusing failure, or worse, a slow success.
+    //
+    // It beats a profile's `gpu_classes`, the way every other flag here does: clap has
+    // already refused `--cpu-only --gpu-class`, so the only classes that can still be
+    // here came from a profile the caller did not type on this command line.
+    if args.cpu_only {
+        gpu_classes.clear();
+    } else if gpu_classes.is_empty() {
+        bail!("no GPU class (pass --gpu-class, set gpu_classes in the profile, or --cpu-only)");
     }
     let priority = args
         .priority
@@ -1309,6 +1454,7 @@ fn resolve_params(cfg: &Config, profile: Option<&Profile>, args: &RunArgs) -> Re
         gate,
         checkpoint,
         name_hint: args.name_hint.clone(),
+        expose_port: args.expose_port,
     })
 }
 
@@ -1370,6 +1516,7 @@ fn save_state(cfg: &Config, run_id: &str, params: &RunParams, groups: &[GroupRef
         profile: params.name_hint.clone(),
         image: Some(params.image.clone()),
         gpu_classes: params.gpu_classes.clone(),
+        gpu_observed: None,
         priority: Some(params.priority.clone()),
         command: params.command.clone(),
         // Record the declared output names so `attach` (which reconstructs from state) can
@@ -1438,6 +1585,19 @@ mod tests {
         ];
         argv.extend_from_slice(extra);
         argv.extend_from_slice(&["--", "true"]); // `run` requires a command
+        use clap::Parser as _;
+        match crate::cli::Cli::parse_from(argv).command {
+            crate::cli::Command::Run(args) => args,
+            other => panic!("expected `run`, parsed {other:?}"),
+        }
+    }
+
+    /// [`run_args`] without a `--gpu-class`, for the paths where the absence of one is
+    /// the thing under test.
+    pub(super) fn run_args_no_class(extra: &[&str]) -> RunArgs {
+        let mut argv = vec!["saladfingers", "run", "--image", "example.invalid/img:t"];
+        argv.extend_from_slice(extra);
+        argv.extend_from_slice(&["--", "true"]);
         use clap::Parser as _;
         match crate::cli::Cli::parse_from(argv).command {
             crate::cli::Command::Run(args) => args,
@@ -1544,6 +1704,118 @@ mod tests {
             run_args(&["--input-zstd-window-log", "27"]).input_zstd_window_log,
             Some(27)
         );
+    }
+
+    /// `--cpu-only` is a flag, so it beats a profile the way `--memory-gb` and
+    /// `--replicas` do. The ported version failed the run instead, with a message
+    /// naming `--gpu-class` — a flag the caller had not passed and could not withdraw,
+    /// because clap already refuses the two together.
+    #[test]
+    fn cpu_only_overrides_a_profiles_gpu_classes() {
+        let profile = Profile {
+            gpu_classes: vec!["rtx 4090 (24 gb)".into()],
+            ..Default::default()
+        };
+        let params = resolve_params(
+            &bare_config(),
+            Some(&profile),
+            &run_args_no_class(&["--cpu-only"]),
+        )
+        .expect("a CPU-only run must not be refused by a profile default");
+        assert!(params.gpu_classes.is_empty());
+
+        // Without the flag the profile still decides.
+        let params = resolve_params(&bare_config(), Some(&profile), &run_args_no_class(&[]))
+            .expect("resolve params");
+        assert_eq!(params.gpu_classes, vec!["rtx 4090 (24 gb)".to_string()]);
+    }
+
+    /// Naming both is a contradiction and dies at parse; naming neither is the mistake
+    /// `--cpu-only` exists to keep loud, since a mistyped class must not silently become
+    /// a CPU rental running a CUDA workload.
+    #[test]
+    fn cpu_only_and_gpu_class_are_mutually_exclusive_and_one_is_required() {
+        use clap::Parser as _;
+        let argv = [
+            "saladfingers",
+            "run",
+            "--image",
+            "example.invalid/img:t",
+            "--cpu-only",
+            "--gpu-class",
+            "rtx 4090 (24 gb)",
+            "--",
+            "true",
+        ];
+        assert!(
+            crate::cli::Cli::try_parse_from(argv).is_err(),
+            "--cpu-only with --gpu-class must be refused at parse"
+        );
+
+        let err = resolve_params(&bare_config(), None, &run_args_no_class(&[]))
+            .err()
+            .expect("neither a class nor --cpu-only");
+        assert!(format!("{err}").contains("--cpu-only"), "{err}");
+    }
+
+    /// The security invariant of `--expose-port`, end to end: the flag, through
+    /// `resolve_params` and the group request, to the JSON that reaches SaladCloud.
+    ///
+    /// `auth=false` here would publish a live training dashboard — on a machine someone
+    /// else owns — to anyone who learns the DNS name, and no other test in the suite
+    /// would notice: `deploy`'s gateway tests build their own `GroupParams` and prove
+    /// only that whatever `run` chooses is serialized faithfully.
+    #[test]
+    fn an_exposed_port_is_always_an_authenticated_gateway() {
+        let cfg = bare_config();
+        let params = resolve_params(&cfg, None, &run_args(&["--expose-port", "8080"]))
+            .expect("resolve params");
+        let gp = shard_group_params(
+            &cfg,
+            &params,
+            "sf-x7k2mq".into(),
+            vec!["uuid-1".into()],
+            saladfingers_api::ContainerPriority::Batch,
+            BTreeMap::new(),
+        );
+        assert_eq!(gp.gateway_port, Some(8080));
+        let body = serde_json::to_value(deploy::build_request(gp)).expect("serialize");
+        assert_eq!(body["networking"]["port"], 8080);
+        assert_eq!(
+            body["networking"]["auth"], true,
+            "run must never create a public gateway: {body}"
+        );
+
+        // And a run without the flag asks for no gateway at all.
+        let plain = resolve_params(&cfg, None, &run_args(&[])).expect("resolve params");
+        assert_eq!(
+            shard_group_params(
+                &cfg,
+                &plain,
+                "sf-x7k2mq".into(),
+                vec![],
+                saladfingers_api::ContainerPriority::Batch,
+                BTreeMap::new(),
+            )
+            .gateway_port,
+            None
+        );
+    }
+
+    /// The hint `run` prints and the port `tunnel` binds are one constant, so the
+    /// instruction cannot send an operator to a port nothing is listening on.
+    #[test]
+    fn the_watch_hint_points_at_the_port_the_tunnel_actually_binds() {
+        let hint = watch_hint("sf-x7k2mq", 0, "https://curious-salad.salad.cloud");
+        assert!(
+            hint.contains(&crate::tunnel::browser_url(crate::cli::DEFAULT_TUNNEL_PORT)),
+            "{hint}"
+        );
+        assert!(
+            !hint.contains("--shard"),
+            "shard 0 is the default and needs no flag: {hint}"
+        );
+        assert!(watch_hint("sf-x7k2mq", 2, "https://x").contains("--shard 2"));
     }
 
     /// Past clap, the tunables are stored unvalidated and the read side silently
@@ -1669,6 +1941,7 @@ mod tests {
             profile: None,
             image: None,
             gpu_classes: vec!["rtx 4090".into()],
+            gpu_observed: None,
             priority: Some("batch".into()),
             command: vec![],
             output_names: None,
