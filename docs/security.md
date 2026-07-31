@@ -14,6 +14,7 @@ the design and cannot be engineered away.
 | Party | Trusted? | Notes |
 | --- | --- | --- |
 | The operator's machine — CLI, config, storage keys, Salad API key | **Yes** | Holds every credential. |
+| A `--on <ssh-host>` build host | **Yes** | Same side of the boundary as the operator's machine: during `image push --on` it holds a registry push token (a `0600` file, removed afterwards) and produces the image that will run. Point it only at hosts you control. |
 | The SaladCloud control plane | **Yes** | Issues gateway URLs, schedules groups, is the billing authority. |
 | **The rented GPU node**, and the `sf-agent` running on it | **No** | Consumer hardware owned by strangers. It executes your command and can read anything inside the container. |
 | End users of `serve --proxy` | **No** | The gateway fronts it with `auth=false`; the app behind it enforces its own auth. |

@@ -71,6 +71,7 @@ pub async fn doctor(cfg: Config, args: DoctorArgs) -> Result<()> {
     validate_profiles(&cfg, &mut checks);
     validate_storage(&cfg, &mut checks);
     validate_registry(&cfg, &mut checks);
+    validate_build_env(&cfg, &mut checks);
 
     // Online checks (proves auth + connectivity).
     let client = cfg.client()?;
@@ -237,6 +238,87 @@ fn validate_registry_push(registry: &RegistryConfig, checks: &mut Vec<Check>) {
             ),
         ));
     }
+}
+
+/// The toolchain `image push` needs. Everything here is a **warning** at worst: a config
+/// that can never push images is still perfectly good for `run`, `session`, and `serve`,
+/// which shell out to nothing. These checks exist because the failure they predict —
+/// building a `.copyTo` for a system this machine cannot execute, or reaching for a skopeo
+/// that is not installed — otherwise only surfaces as an opaque error deep into a push.
+fn validate_build_env(cfg: &Config, checks: &mut Vec<Check>) {
+    for (tool, hint) in [
+        ("nix", "required by `image push`"),
+        (
+            "skopeo",
+            "required by `image push` (provided by `nix develop`)",
+        ),
+    ] {
+        match tool_version(tool) {
+            Some(v) => checks.push(Check::ok(tool, v)),
+            None => checks.push(Check::warn(tool, format!("not on PATH — {hint}"))),
+        }
+    }
+
+    let system = crate::image::effective_image_system(cfg);
+    if let Some(host) = crate::image::configured_build_host(cfg) {
+        checks.push(Check::ok(
+            "image build",
+            format!("on {host} (system {system}) — `[build] host`"),
+        ));
+        return;
+    }
+
+    // A system this machine cannot execute needs a builder; nix only tells us about one
+    // via `builders` / `extra-platforms`.
+    if crate::image::is_locally_runnable(&system) {
+        checks.push(Check::ok("image build", format!("local (system {system})")));
+    } else if nix_config_mentions(&system) {
+        checks.push(Check::ok(
+            "image build",
+            format!("system {system} via a configured remote builder"),
+        ));
+    } else {
+        checks.push(Check::warn(
+            "image build",
+            format!(
+                "system {system} is not runnable here and no builder for it appears in \
+                 `nix config show` — configure one, use `--on <ssh-host>`, or let the \
+                 default native system be used (see docs/macos.md)"
+            ),
+        ));
+    }
+}
+
+/// `<tool> --version`'s first line, or `None` if it cannot be run at all.
+fn tool_version(tool: &str) -> Option<String> {
+    let out = std::process::Command::new(tool)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Some(text.lines().next()?.trim().to_string())
+}
+
+/// Whether `nix config show` names `system` among the builders or extra platforms.
+/// Deliberately a substring test: the goal is a helpful hint, not an exact model of
+/// nix's builder-selection rules.
+fn nix_config_mentions(system: &str) -> bool {
+    let Ok(out) = std::process::Command::new("nix")
+        .args(["config", "show"])
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.starts_with("builders") || l.starts_with("extra-platforms"))
+        .any(|l| l.contains(system))
 }
 
 fn check_env_ref(env_name: Option<&str>, field: &str, missing: &mut Vec<String>) {

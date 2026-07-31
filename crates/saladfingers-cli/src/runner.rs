@@ -1395,6 +1395,7 @@ mod tests {
             api_key: saladfingers_api::Secret::new("k"),
             storage: None,
             registry: None,
+            build: crate::config::BuildConfig::default(),
             defaults: crate::config::Defaults::default(),
             profiles: std::collections::BTreeMap::new(),
         }

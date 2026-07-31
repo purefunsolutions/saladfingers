@@ -443,6 +443,15 @@ pub struct ImagePushArgs {
     /// Tag to push (the recorded lockfile ref is always digest-pinned).
     #[arg(long, default_value = "latest")]
     pub tag: String,
+    /// Build and push on this SSH host instead of locally, so the image closure never
+    /// crosses this machine's link (it is substituted straight onto the remote).
+    #[arg(long, value_name = "SSH_HOST")]
+    pub on: Option<String>,
+    /// Flake system whose `<name>-image` attribute to build. Defaults to this machine's
+    /// own system on macOS and `x86_64-linux` elsewhere; with `--on`, to `x86_64-linux`.
+    /// The image itself is linux/amd64 regardless.
+    #[arg(long)]
+    pub system: Option<String>,
     /// Emit JSON instead of a table.
     #[arg(long)]
     pub json: bool,

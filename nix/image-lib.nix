@@ -10,8 +10,25 @@
 # layered on by flavor:
 #   none | cuda-min | cuda-runtime | cuda-full | rocm-runtime
 # The NVIDIA/AMD *driver* is injected by the host; images bring only userspace.
+#
+# TARGET vs NATIVE pkgs. `pkgs` is the *target* platform — everything whose content
+# lands in the image (sf-agent, busybox, glibc, the CUDA/ROCm userspace) comes from it,
+# and it is what makes the image linux/amd64. `nativePkgs` is the platform doing the
+# *assembling*; it defaults to `pkgs`, so the all-Linux path is bit-identical to before.
+#
+# The split is what lets an aarch64-darwin host build a linux/amd64 image with no Linux
+# builder at all. A Nix image is assembled from prebuilt binaries, never compiled: the
+# x86_64-linux contents substitute from a cache as-is, and the only derivations that must
+# actually *run* are nix2container's assembly glue — buildEnv symlink trees, a runCommand
+# writing /etc, and the layer/manifest JSON. Those are `allowSubstitutes = false`, so they
+# can never be fetched and must be built wherever the push happens; pointing them at
+# `nativePkgs` is what moves them off x86_64-linux. They only symlink, copy and write
+# files, and nix2container computes layers from store *metadata*
+# (`exportReferencesGraph`) without executing any of the content, so nothing here needs to
+# run x86_64 code. Emulation is needed only for image contents you compile yourself.
 {
   pkgs,
+  nativePkgs ? pkgs,
   n2c,
   sfAgent,
 }: let
@@ -45,8 +62,9 @@
 
   # /bin: sf-agent + busybox applets (incl. sh, so `container.command =
   # ["/bin/sh","-c",...]` always works). Runtime deps ride along in the image
-  # closure computed by nix2container.
-  baseRoot = pkgs.buildEnv {
+  # closure computed by nix2container. Built natively (it only symlinks target
+  # store paths into a tree — no target code runs).
+  baseRoot = nativePkgs.buildEnv {
     name = "sf-base-root";
     paths = [sfAgent pkgs.busybox];
     pathsToLink = ["/bin"];
@@ -56,7 +74,9 @@
   # prestart hook regenerates /etc/ld.so.cache in-container and aborts the start
   # if it can't. The /lib64 loader symlink lets host-injected FHS glibc binaries
   # (nvidia-smi & co.) actually execute; glibc is already in the closure.
-  etcRoot = pkgs.runCommand "sf-etc-root" {} ''
+  # Native builder, but every path it references is the TARGET's: the loader symlink
+  # must point at the linux glibc or host-injected binaries cannot exec.
+  etcRoot = nativePkgs.runCommand "sf-etc-root" {} ''
     mkdir -p $out/etc/ssl/certs $out/tmp $out/work $out/root $out/lib64
     ln -s ${pkgs.glibc}/lib/ld-linux-x86-64.so.2 $out/lib64/ld-linux-x86-64.so.2
     cp ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt $out/etc/ssl/certs/ca-bundle.crt
@@ -78,6 +98,12 @@ in
     ports ? [],
     extraContents ? [],
     maxLayers ? 40,
+    # The OCI architecture stamped into the manifest. SaladCloud is linux/amd64 only, so
+    # that is the default; a caller targeting another arch must say so explicitly. Never
+    # derive this from the platform: nix2container's own default is the *native* go's
+    # GOARCH, which on this Mac would silently stamp `arm64` on an image full of
+    # x86_64-linux binaries. The OS is always "linux" (hardcoded by nix2container).
+    arch ? "amd64",
   }: let
     libs = gpuLibs {inherit cudaPackages rocmPackages flavor;};
     flavor = gpu;
@@ -93,7 +119,7 @@ in
     weightLayers = map (w:
       n2c.buildLayer {
         copyToRoot = [
-          (pkgs.buildEnv {
+          (nativePkgs.buildEnv {
             name = "weights-${baseNameOf w.targetDir}";
             paths = [w.source];
             extraPrefix = w.targetDir;
@@ -133,7 +159,7 @@ in
         (builtins.filter (w: (w ? envVar) && w.envVar != null) weights));
   in
     n2c.buildImage ({
-        inherit name maxLayers;
+        inherit name maxLayers arch;
         copyToRoot = [baseRoot etcRoot] ++ contents ++ extraContents;
         layers = gpuLayer ++ weightLayers;
         config = {

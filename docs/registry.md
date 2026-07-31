@@ -98,6 +98,20 @@ Push credentials are resolved independently for the username and password, in or
 So a registry that uses one credential for both pull and push needs no extra config;
 a registry with a separate push token gets it via the dedicated env vars above.
 
+### Pushing from another machine (`--on`)
+
+`saladfingers image push --on <ssh-host>` builds and pushes on a remote, so the image
+closure is substituted onto that machine and never crosses your link (see
+[macos.md](macos.md)). The credential handling is unchanged in spirit but gains one hop:
+`skopeo login` still runs **locally** — bad credentials fail before an expensive build —
+and the resulting authfile is streamed over the SSH channel into a `0600` file inside a
+`0700` temp dir on the remote, which is removed when the push finishes or fails. The token
+is never an argument to any command, on either machine.
+
+The consequence is a trust one: for the duration of the push, that host holds a registry
+push token, so it belongs on the trusted side of the boundary in
+[security.md](security.md). Point `--on` at machines you control.
+
 ## Options
 
 ### Self-hosted standalone registry (recommended for heavy use)

@@ -13,12 +13,19 @@
 //! pushed digest from a `--digestfile` → merge `{name → {ref, digest, flakeRev,
 //! pushedAt}}` into the lockfile (digest-pinned `ref`, sorted keys, pretty JSON).
 //!
+//! Where that build+push runs is the one platform-dependent part. `.copyTo` is a package
+//! of the system it is built under, so it must be a system this machine can execute:
+//! `x86_64-linux` on Linux, but the *darwin* attribute on macOS, which assembles the same
+//! linux/amd64 image natively (see `nix/image-lib.nix`). `--on <ssh-host>` instead builds
+//! and pushes on a remote, keeping the multi-GB closure off this machine's link entirely.
+//!
 //! Security: this module reads the registry host, org, and credentials only by
 //! *reference* (config keys / env-var names). No registry host, org, or secret is
 //! ever hard-coded here, and the push token is passed to skopeo on stdin — never on
 //! the command line or in any log line.
 
 use std::collections::BTreeMap;
+use std::env;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -132,8 +139,8 @@ const GZIP_MAX_LEVEL: &str = "9";
 const ZSTD_BEST_TIER_LEVEL: &str = "19";
 /// Env var overriding the flake system images are built under (default below).
 const IMAGE_SYSTEM_ENV: &str = "SALADFINGERS_IMAGE_SYSTEM";
-/// Images are linux/amd64 only and defined under this system in `nix/images.nix`,
-/// regardless of the host (a macOS host pushes via a remote x86_64-linux builder).
+/// The system images are *declared* under (`saladfingers.imageSystem`), and the build
+/// system for any non-macOS host. Images are linux/amd64 whatever builds them.
 const DEFAULT_IMAGE_SYSTEM: &str = "x86_64-linux";
 
 /// One recorded image entry in `saladfingers-images.lock`.
@@ -172,7 +179,8 @@ pub fn push(cfg: Config, args: ImagePushArgs) -> Result<()> {
     let (user, pass) = resolve_push_credentials(cfg.registry.as_ref())?;
 
     let tagged_ref = tagged_ref(&base, &args.name, &args.tag);
-    let system = image_system();
+    let system = image_system(&args, &cfg);
+    let remote = remote_host(&args, &cfg).map(str::to_string);
     let root = repo_root();
 
     // A private (0700) temp dir holds the authfile (registry token, 0600 via skopeo)
@@ -187,21 +195,38 @@ pub fn push(cfg: Config, args: ImagePushArgs) -> Result<()> {
     eprintln!("image push {}: authenticating to {host}...", args.name);
     skopeo_login(&host, &user, &pass, &authfile)?;
 
-    eprintln!(
-        "image push {}: building and pushing docker://{tagged_ref}...",
-        args.name
-    );
-    run_copy_to(
-        &root,
-        &system,
-        &args.name,
-        &tagged_ref,
-        &digestfile,
-        &authfile,
-        &compression,
-    )?;
+    let digest = if let Some(remote) = remote.as_deref() {
+        eprintln!(
+            "image push {}: building and pushing docker://{tagged_ref} on {remote} \
+             (system {system})...",
+            args.name
+        );
+        push_via_remote(
+            &root,
+            remote,
+            &system,
+            &args.name,
+            &tagged_ref,
+            &authfile,
+            &compression,
+        )?
+    } else {
+        eprintln!(
+            "image push {}: building and pushing docker://{tagged_ref} (system {system})...",
+            args.name
+        );
+        run_copy_to(
+            &root,
+            &system,
+            &args.name,
+            &tagged_ref,
+            &digestfile,
+            &authfile,
+            &compression,
+        )?;
+        read_digest(&digestfile)?
+    };
 
-    let digest = read_digest(&digestfile)?;
     let image_ref = digest_ref(&base, &args.name, &digest);
     let flake_rev = flake_rev(&root);
     let pushed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
@@ -485,6 +510,183 @@ fn compression_args_from(env: &impl Fn(&str) -> Option<String>) -> Result<Vec<St
     ])
 }
 
+// ---- remote build + push (`--on`) -----------------------------------------
+
+/// Build and push entirely on `host`, returning the pushed digest.
+///
+/// Evaluation stays local (`--eval-store auto`) but the *store* is the remote, so the
+/// image closure is substituted straight onto that machine from its own binary caches
+/// and pushed from there — nothing multi-GB crosses this machine's link. That is the
+/// whole point of `--on`: use it when the remote's uplink beats yours.
+///
+/// The registry token never touches a command line or the remote's process table:
+/// `skopeo login` has already run locally, and the resulting authfile is streamed over
+/// the encrypted channel into a 0600 file inside a 0700 remote temp dir, which is
+/// removed again whether or not the push succeeded.
+fn push_via_remote(
+    root: &Path,
+    host: &str,
+    system: &str,
+    name: &str,
+    tagged_ref: &str,
+    authfile: &Path,
+    compression: &[String],
+) -> Result<String> {
+    let attr = format!("{}#packages.{system}.{name}-image.copyTo", root.display());
+    let out = capture(
+        Command::new("nix")
+            .arg("build")
+            .arg("--store")
+            .arg(format!("ssh-ng://{host}"))
+            .arg("--eval-store")
+            .arg("auto")
+            .arg("--no-link")
+            .arg("--print-out-paths")
+            .arg(&attr)
+            .current_dir(root),
+        "building the image on the remote store (`nix build --store ssh-ng://…`)",
+    )?;
+    let copy_to = out
+        .lines()
+        .next_back()
+        .map(str::trim)
+        .filter(|p| p.starts_with("/nix/store/"))
+        .with_context(|| format!("`nix build {attr}` printed no store path (got {out:?})"))?
+        .to_string();
+
+    let tmp = remote_mktemp(host)?;
+    // From here on every early return must still clean up the remote dir.
+    let result = (|| -> Result<String> {
+        let auth = format!("{tmp}/auth.json");
+        let digest = format!("{tmp}/digest");
+
+        let bytes = std::fs::read(authfile).context("reading the local authfile to stream")?;
+        ssh_stdin(
+            host,
+            &format!("umask 077 && cat > {}", shell_quote(&auth)),
+            &bytes,
+            "streaming the registry authfile to the remote",
+        )?;
+
+        let push = format!(
+            "{} docker://{} --digestfile {} --authfile {}{}",
+            shell_quote(&format!("{copy_to}/bin/copy-to")),
+            shell_quote(tagged_ref),
+            shell_quote(&digest),
+            shell_quote(&auth),
+            // The same compression the local path uses. The remote's uplink is the
+            // reason to use `--on` at all, so sending raw layers there would defeat it.
+            compression
+                .iter()
+                .map(|a| format!(" {}", shell_quote(a)))
+                .collect::<String>(),
+        );
+        // Inherited stdio: the skopeo upload is the slow part, so its progress must show.
+        let status = Command::new("ssh")
+            .arg(host)
+            .arg(&push)
+            .status()
+            .context("spawning `ssh … copy-to` (is ssh on PATH?)")?;
+        if !status.success() {
+            bail!("remote image push failed (`copy-to` on {host} exited with {status})");
+        }
+
+        let raw = ssh_capture(
+            host,
+            &format!("cat {}", shell_quote(&digest)),
+            "reading the pushed digest from the remote",
+        )?;
+        parse_digest(&raw)
+    })();
+
+    // Best-effort: the push already succeeded or failed on its own merits and a failed
+    // cleanup must not mask that, but a leftover authfile is worth saying out loud.
+    if let Err(e) = ssh_capture(
+        host,
+        &format!("rm -rf {}", shell_quote(&tmp)),
+        "removing the remote temp dir",
+    ) {
+        eprintln!("warning: could not remove {host}:{tmp} (it holds a registry token): {e:#}");
+    }
+    result
+}
+
+/// `mktemp -d` on the remote, validated before it is ever interpolated into a command.
+fn remote_mktemp(host: &str) -> Result<String> {
+    let raw = ssh_capture(
+        host,
+        "umask 077 && mktemp -d /tmp/saladfingers-push-XXXXXXXX",
+        "creating a temp dir on the remote",
+    )?;
+    let path = raw.trim().to_string();
+    if !is_safe_remote_tmp(&path) {
+        bail!("remote mktemp returned an unexpected path: {path:?}");
+    }
+    Ok(path)
+}
+
+/// Whether a remote `mktemp -d` result is the shape we asked for. Guards against a
+/// remote whose shell profile prints banners, and keeps `rm -rf` pointed somewhere sane.
+fn is_safe_remote_tmp(path: &str) -> bool {
+    path.strip_prefix("/tmp/saladfingers-push-")
+        .is_some_and(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric()))
+}
+
+/// Single-quote a value for the remote shell (ssh always runs the command through one).
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Run `ssh host <cmd>` and capture stdout.
+fn ssh_capture(host: &str, cmd: &str, what: &str) -> Result<String> {
+    capture(Command::new("ssh").arg(host).arg(cmd), what)
+}
+
+/// Run a prepared command and capture stdout, failing with its stderr.
+fn capture(cmd: &mut Command, what: &str) -> Result<String> {
+    let out = cmd
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("spawning: {what}"))?;
+    if !out.status.success() {
+        bail!(
+            "{what} failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Run `ssh host <cmd>` feeding `input` on stdin (used to stream the authfile).
+fn ssh_stdin(host: &str, cmd: &str, input: &[u8], what: &str) -> Result<()> {
+    let mut child = Command::new("ssh")
+        .arg(host)
+        .arg(cmd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawning: {what}"))?;
+    {
+        let mut stdin = child.stdin.take().context("ssh stdin unavailable")?;
+        stdin
+            .write_all(input)
+            .with_context(|| format!("writing stdin for: {what}"))?;
+    }
+    let out = child
+        .wait_with_output()
+        .with_context(|| format!("waiting for: {what}"))?;
+    if !out.status.success() {
+        bail!(
+            "{what} failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// Build and push the image via its nix2container `.copyTo` app, writing the pushed
 /// digest to `digestfile`. Inherits stdio so nix build/push progress is visible.
 ///
@@ -514,20 +716,127 @@ fn run_copy_to(
         .status()
         .context("spawning `nix run … copyTo` (is nix on PATH?)")?;
     if !status.success() {
-        bail!("image build/push failed (`nix run {attr}` exited with {status})");
+        bail!(
+            "image build/push failed (`nix run {attr}` exited with {status}).\n\
+             If the attribute does not exist, this saladfingers predates cross-system \
+             image packages — update it, or build under the declaring system with \
+             `--system {DEFAULT_IMAGE_SYSTEM}` (which needs a {DEFAULT_IMAGE_SYSTEM} \
+             builder configured)."
+        );
     }
     Ok(())
 }
 
-/// The `<system>` component of the image flake attribute.
-fn image_system() -> String {
-    non_empty_env(IMAGE_SYSTEM_ENV).unwrap_or_else(|| DEFAULT_IMAGE_SYSTEM.to_string())
+/// The `<system>` component of the image flake attribute, highest precedence first:
+/// `--system` > `SALADFINGERS_IMAGE_SYSTEM` > `[build] image_system` > the default for
+/// this host ([`default_image_system`]).
+fn image_system(args: &ImagePushArgs, cfg: &Config) -> String {
+    let trimmed = |s: &str| -> Option<String> {
+        let t = s.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    };
+    args.system
+        .as_deref()
+        .and_then(trimmed)
+        .or_else(|| non_empty_env(IMAGE_SYSTEM_ENV))
+        .or_else(|| cfg.build.image_system.as_deref().and_then(trimmed))
+        .unwrap_or_else(|| {
+            default_image_system(
+                remote_host(args, cfg).is_some(),
+                env::consts::OS,
+                env::consts::ARCH,
+            )
+            .to_string()
+        })
+}
+
+/// The image system to build when nothing was configured explicitly.
+///
+/// `.copyTo` is an executable of the system it was built under, so it has to be one this
+/// machine can run. A macOS host therefore builds the *darwin* attribute: the image is
+/// still linux/amd64, but its assembly derivations are native, so no Linux builder is
+/// involved at all (see `nix/image-lib.nix`). Every other host keeps `x86_64-linux`,
+/// which is both the declaring system and — on Linux — natively runnable.
+///
+/// With `--on`, the build happens on the remote, so the local platform is irrelevant.
+fn default_image_system(remote: bool, os: &str, arch: &str) -> &'static str {
+    if remote || os != "macos" {
+        return DEFAULT_IMAGE_SYSTEM;
+    }
+    match arch {
+        "x86_64" => "x86_64-darwin",
+        // aarch64 today; anything else macOS might run would still be arm64.
+        _ => "aarch64-darwin",
+    }
+}
+
+/// The SSH host that should build and push, if any: `--on` > `[build] host`.
+fn remote_host<'a>(args: &'a ImagePushArgs, cfg: &'a Config) -> Option<&'a str> {
+    args.on
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| configured_build_host(cfg))
+}
+
+/// The `[build] host`, if set — the `--on` default. Used by `doctor` to report where a
+/// push would build.
+#[must_use]
+pub fn configured_build_host(cfg: &Config) -> Option<&str> {
+    cfg.build
+        .host
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// The image system a push would use with no `--system` flag, for `doctor` to report.
+#[must_use]
+pub fn effective_image_system(cfg: &Config) -> String {
+    non_empty_env(IMAGE_SYSTEM_ENV)
+        .or_else(|| {
+            cfg.build
+                .image_system
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| {
+            default_image_system(
+                configured_build_host(cfg).is_some(),
+                env::consts::OS,
+                env::consts::ARCH,
+            )
+            .to_string()
+        })
+}
+
+/// Whether a flake system's derivations can execute on this machine — i.e. whether a
+/// `.copyTo` built for it could be run directly. Rosetta/binfmt can widen this in
+/// practice, so it is only used to decide whether to *look* for a remote builder.
+#[must_use]
+pub fn is_locally_runnable(system: &str) -> bool {
+    let Some((arch, os)) = system.split_once('-') else {
+        return false;
+    };
+    let os_matches = match env::consts::OS {
+        "macos" => os == "darwin",
+        other => os == other,
+    };
+    os_matches && arch == env::consts::ARCH
 }
 
 /// Read + validate the pushed digest from the digestfile written by `copyTo`.
 fn read_digest(digestfile: &Path) -> Result<String> {
     let raw = std::fs::read_to_string(digestfile)
         .context("reading the pushed digest (copyTo did not write a --digestfile)")?;
+    parse_digest(&raw)
+}
+
+/// Validate a digest as written by `copyTo`, from wherever it was read — a local file,
+/// or the stdout of a `cat` over ssh.
+fn parse_digest(raw: &str) -> Result<String> {
     let digest = raw.trim().to_string();
     if !digest.starts_with("sha256:") || digest.len() <= "sha256:".len() {
         bail!("copyTo wrote an unexpected digest: {digest:?}");
@@ -821,6 +1130,61 @@ mod tests {
             tagged_ref("registry.example.com/my-org/", "kernel-test", "latest"),
             "registry.example.com/my-org/kernel-test:latest"
         );
+    }
+
+    #[test]
+    fn macos_defaults_to_a_native_darwin_image_system() {
+        // macOS builds the darwin attribute: same linux/amd64 image, native assembly,
+        // no Linux builder needed.
+        assert_eq!(
+            default_image_system(false, "macos", "aarch64"),
+            "aarch64-darwin"
+        );
+        assert_eq!(
+            default_image_system(false, "macos", "x86_64"),
+            "x86_64-darwin"
+        );
+        // Every other host keeps the declaring system...
+        assert_eq!(
+            default_image_system(false, "linux", "x86_64"),
+            "x86_64-linux"
+        );
+        assert_eq!(
+            default_image_system(false, "linux", "aarch64"),
+            "x86_64-linux"
+        );
+        // ...and with --on the local platform is irrelevant: the remote does the build.
+        assert_eq!(
+            default_image_system(true, "macos", "aarch64"),
+            "x86_64-linux"
+        );
+    }
+
+    #[test]
+    fn remote_tmp_paths_are_validated_before_use() {
+        assert!(is_safe_remote_tmp("/tmp/saladfingers-push-a1b2C3d4"));
+        // A remote whose shell profile prints a banner, or any injection attempt, must
+        // not reach the `rm -rf`.
+        for bad in [
+            "",
+            "/tmp",
+            "/tmp/saladfingers-push-",
+            "/tmp/other",
+            "/tmp/saladfingers-push-x y",
+            "/tmp/saladfingers-push-x; rm -rf /",
+            "Welcome!\n/tmp/saladfingers-push-abcd",
+            "../../etc",
+        ] {
+            assert!(!is_safe_remote_tmp(bad), "must reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn shell_quoting_survives_embedded_quotes() {
+        assert_eq!(shell_quote("/tmp/x"), "'/tmp/x'");
+        // The classic break-out attempt closes the quote; the escape must re-open it.
+        assert_eq!(shell_quote("a'b"), r"'a'\''b'");
+        assert_eq!(shell_quote("a b; rm -rf /"), "'a b; rm -rf /'");
     }
 
     #[test]
