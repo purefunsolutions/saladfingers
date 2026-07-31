@@ -14,9 +14,12 @@ use std::collections::{HashSet, VecDeque};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use saladfingers_api::{LogEntriesQuery, LogEntry, SaladClient};
+use saladfingers_protocol::transfer;
 
 use crate::cli::LogsArgs;
 use crate::config::Config;
+use crate::presign::S3Backend;
+use crate::spec;
 use crate::state;
 
 /// Entries one request can return. The endpoint validates `page_size` to `1..=100`
@@ -134,8 +137,68 @@ pub async fn fetch_entries(
     Ok((out, truncated))
 }
 
-/// `saladfingers logs RUN_ID [--follow] [--limit N] [--all] [--since DUR]`
+/// How long the presigned GET for an uploaded log stays valid — long enough to read a
+/// 16 MiB object over a slow link, short enough to remain a bounded credential. It is
+/// consumed on the next line, so it need not outlive its use by an hour.
+const UPLOADED_EXPIRY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Print the complete copy the agent uploaded to storage.
+///
+/// The platform's log service is best-effort by construction: it answers a bounded page at
+/// a time (which is why the query above bisects) and stamps entries with the *node's*
+/// clock. The agent's capture travels the same path as the run's inputs, outputs, and
+/// result envelope, where nothing is capped or reordered — so when the two disagree, this
+/// is the one to believe.
+async fn uploaded(cfg: &Config, args: &LogsArgs) -> Result<()> {
+    let storage = cfg
+        .storage
+        .as_ref()
+        .context("`logs --uploaded` needs an S3-compatible [storage] backend")?;
+    let backend = S3Backend::from_config(storage)?;
+    let body = fetch_uploaded(&backend, &args.run_id, args.shard).await?;
+    // The child wrote these bytes, so they need not be valid UTF-8 (a job that emits a
+    // progress bar or a binary blob still deserves a readable log). Pass them through.
+    std::io::Write::write_all(&mut std::io::stdout(), &body)?;
+    Ok(())
+}
+
+/// The agent's uploaded output for one shard, verbatim.
+///
+/// Split from `uploaded` so the storage key is reachable from a test: `S3Backend`
+/// reads its credentials from the environment, which a test cannot set safely, but it
+/// can be built directly.
+///
+/// # Errors
+/// Returns an error if the object is missing or the fetch fails.
+pub async fn fetch_uploaded(backend: &S3Backend, run_id: &str, shard: u32) -> Result<Vec<u8>> {
+    let key = format!("{}/log.txt", spec::shard_prefix(run_id, shard));
+    let http = transfer::transfer_client()?;
+    let resp = http
+        .get(backend.presign_get(&key, UPLOADED_EXPIRY))
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)
+        .context("fetching the run's uploaded output")?;
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "no uploaded output for {run_id} shard {shard} ({}). The agent uploads it just \
+         before the result envelope, so a run killed before it committed has only its \
+         container stdout — try `saladfingers logs {run_id}` without --uploaded.",
+        resp.status(),
+    );
+    let body = resp
+        .bytes()
+        .await
+        .map_err(reqwest::Error::without_url)
+        .context("reading the run's uploaded output")?;
+    Ok(body.to_vec())
+}
+
+/// `saladfingers logs RUN_ID [--follow] [--limit N] [--all] [--since DUR] [--uploaded]`
 pub async fn logs(cfg: Config, args: LogsArgs) -> Result<()> {
+    if args.uploaded {
+        return uploaded(&cfg, &args).await;
+    }
     let client = cfg.client()?;
     let names = match state::load_run(&args.run_id)? {
         Some(run) => run.group_names(),

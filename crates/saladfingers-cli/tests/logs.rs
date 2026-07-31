@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
 use saladfingers_api::{RetryPolicy, SaladClient, SaladClientConfig, Secret};
-use saladfingers_cli::logs::fetch_entries;
+use saladfingers_cli::logs::{fetch_entries, fetch_uploaded};
+use saladfingers_cli::presign::S3Backend;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -270,4 +271,73 @@ fn follow_refuses_the_window_flags_without_tripping_on_their_defaults() {
             "{extra:?} with --follow must be refused, not silently ignored"
         );
     }
+}
+
+/// `--shard` addresses one shard's storage key, so it means nothing without `--uploaded`
+/// and must say so rather than being quietly dropped.
+#[test]
+fn shard_only_means_something_with_uploaded() {
+    use clap::Parser as _;
+
+    assert!(
+        saladfingers_cli::cli::Cli::try_parse_from([
+            "saladfingers",
+            "logs",
+            "sf-x",
+            "--shard",
+            "1"
+        ])
+        .is_err()
+    );
+    assert!(
+        saladfingers_cli::cli::Cli::try_parse_from([
+            "saladfingers",
+            "logs",
+            "sf-x",
+            "--uploaded",
+            "--shard",
+            "1"
+        ])
+        .is_ok()
+    );
+    // The default must not trip `requires`, or `--uploaded` alone would stop working.
+    assert!(
+        saladfingers_cli::cli::Cli::try_parse_from(["saladfingers", "logs", "sf-x", "--uploaded"])
+            .is_ok()
+    );
+}
+
+fn backend(base: &str) -> S3Backend {
+    S3Backend::new(base, "auto", "b", true, "AKID", "SECRET").expect("backend")
+}
+
+/// The agent writes `runs/<run-id>/<shard>/log.txt` and this reads it: one key, two
+/// crates, and nothing that would fail loudly if they drifted apart. The bytes come back
+/// verbatim — a job that emits a progress bar or a binary blob still gets its log.
+#[tokio::test]
+async fn the_uploaded_log_is_read_from_the_shards_key_and_passed_through_byte_for_byte() {
+    let server = MockServer::start().await;
+    let raw = vec![0xff, 0xfe, b'h', b'i', b'\n'];
+    Mock::given(method("GET"))
+        .and(path("/b/runs/sf-x7k2mq/2/log.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(raw.clone()))
+        .mount(&server)
+        .await;
+
+    let got = fetch_uploaded(&backend(&server.uri()), "sf-x7k2mq", 2)
+        .await
+        .expect("fetch");
+    assert_eq!(got, raw, "not valid UTF-8, and not this command's business");
+}
+
+/// A run that died before committing its capture has no object here. That is ordinary, so
+/// the error has to point at the copy that does exist rather than reading as a bug.
+#[tokio::test]
+async fn a_missing_uploaded_log_names_the_command_that_still_works() {
+    let server = MockServer::start().await;
+    let err = fetch_uploaded(&backend(&server.uri()), "sf-x7k2mq", 0)
+        .await
+        .expect_err("nothing was ever uploaded");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("without --uploaded"), "{msg}");
 }

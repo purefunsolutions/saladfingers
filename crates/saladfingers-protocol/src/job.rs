@@ -158,8 +158,11 @@ pub struct ControlUrls {
     pub attempts_put: String,
     /// GET: the attempts ledger.
     pub attempts_get: String,
-    /// PUT: reserved for a rolling log tail; the agent does not write it yet.
-    /// Container stdout is queryable via SaladCloud's org log storage for ~90 days
-    /// (including after group deletion), which `saladfingers logs` uses instead.
+    /// PUT: the run's captured stdout/stderr, written just before the envelope.
+    /// Container stdout is also queryable via SaladCloud's org log storage for ~90 days
+    /// (including after group deletion), which `saladfingers logs` reads — but that path
+    /// pages 100 entries at a time and stamps entries with the node's clock, so it is
+    /// best-effort. This object is the complete copy, on the same storage as the run's
+    /// inputs, outputs, and result.
     pub log_put: String,
 }

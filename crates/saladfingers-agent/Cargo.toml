@@ -28,6 +28,9 @@ tokio = { workspace = true, features = [
   "sync",
   "fs",
   "io-util",
+  # `io-std`: the run supervisor tees the child's piped output back to the agent's own
+  # stdout/stderr, so the container log stream is unchanged by the capture.
+  "io-std",
 ] }
 reqwest = { workspace = true }
 axum = { workspace = true }

@@ -288,6 +288,16 @@ pub struct LogsArgs {
     /// How far back to search (e.g. `90m`, `6h`).
     #[arg(long, default_value = "24h", conflicts_with = "follow")]
     pub since: String,
+    /// Print the complete copy the agent uploaded to storage instead of querying the
+    /// platform's log service.
+    #[arg(long, conflicts_with = "follow")]
+    pub uploaded: bool,
+    /// Shard whose uploaded output to print.
+    ///
+    /// Only meaningful with `--uploaded`, which addresses one shard's storage key;
+    /// the platform query covers every shard's group at once.
+    #[arg(long, default_value_t = 0, requires = "uploaded")]
+    pub shard: u32,
 }
 
 #[derive(Debug, Args)]

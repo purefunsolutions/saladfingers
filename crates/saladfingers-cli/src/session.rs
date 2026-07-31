@@ -332,6 +332,10 @@ async fn logs_via_container(cfg: Config, name: &str) -> Result<()> {
             limit: 1000,
             all: false,
             since: "24h".to_string(),
+            // A session's output lives in the agent's exec ring, not a batch run's uploaded
+            // capture; this fallback is specifically the container-stdout view.
+            uploaded: false,
+            shard: 0,
         },
     )
     .await

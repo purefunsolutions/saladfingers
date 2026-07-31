@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -20,8 +21,10 @@ use saladfingers_protocol::{
     AttemptRecord, Attempts, GpuVendor, JobSpec, JobStatus, NodeInfo, PROTOCOL_VERSION,
     ResultEnvelope, Timings, UploadReport, transfer,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::Mutex;
 
 use crate::imds::ImdsClient;
 use crate::probe;
@@ -165,6 +168,17 @@ pub async fn run(_args: RunArgs) -> Result<()> {
         }
     }
 
+    // Ship the captured output before the envelope, and whatever the status: a failed run's
+    // output is the most valuable thing it produced, and the envelope's arrival is what ends
+    // the run as far as the CLI is concerned. A failure here is never fatal — the run's real
+    // result is already computed, and the output also went to container stdout on the way.
+    if let Some(path) = &outcome.log_path {
+        match upload_log(&http, &spec.urls.log_put, path).await {
+            Ok(()) => tracing::info!("uploaded captured run output"),
+            Err(e) => tracing::warn!("run log upload failed: {e:#}"),
+        }
+    }
+
     let envelope = ResultEnvelope {
         v: PROTOCOL_VERSION,
         run_id: spec.run_id.clone(),
@@ -195,6 +209,8 @@ struct Outcome {
     exec_start: DateTime<Utc>,
     exec_end: DateTime<Utc>,
     agent_exit_code: i32,
+    /// The captured child output, ready to upload (see [`Capture`]).
+    log_path: Option<PathBuf>,
 }
 
 enum ExecEnd {
@@ -202,6 +218,12 @@ enum ExecEnd {
     Interrupted,
     TimedOut,
 }
+
+/// How long to keep draining the child's pipes after it exits. Normally both hit EOF the
+/// instant the child dies, but a grandchild that inherited the pipe keeps the write end open
+/// for as long as it lives — without a bound, a job that leaves a daemon behind would hang
+/// the agent here forever instead of committing its envelope.
+const DRAIN_GRACE: Duration = Duration::from_secs(10);
 
 async fn exec(spec: &JobSpec, ckpt_dirty: &std::sync::atomic::AtomicBool) -> Outcome {
     let exec_start = Utc::now();
@@ -212,7 +234,13 @@ async fn exec(spec: &JobSpec, ckpt_dirty: &std::sync::atomic::AtomicBool) -> Out
     let mut cmd = Command::new(program);
     cmd.args(args)
         .current_dir(workdir(spec))
-        .stdin(Stdio::null());
+        .stdin(Stdio::null())
+        // Piped rather than inherited so the agent can keep a complete copy of the run's
+        // output and upload it alongside the envelope. Both streams are teed straight back
+        // to the agent's own fds, so container stdout still carries everything live and
+        // `saladfingers logs --follow` is unaffected.
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     for (key, value) in &spec.env {
         cmd.env(key, value);
     }
@@ -225,6 +253,23 @@ async fn exec(spec: &JobSpec, ckpt_dirty: &std::sync::atomic::AtomicBool) -> Out
     let stop_signal = parse_signal(spec.stop_signal.as_deref());
     let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     let max_duration = spec.max_duration_secs.map(Duration::from_secs);
+
+    let capture = Capture::create().await.map(|c| Arc::new(Mutex::new(c)));
+    // The pumps run whether or not the capture file opened. Now that the streams are piped,
+    // *something* must read them: a child that outruns the pipe buffer (64 KiB by default)
+    // blocks in write(2) until someone drains it, so an unread pipe would hang the job.
+    let pumps = (
+        tokio::spawn(tee(
+            child.stdout.take(),
+            tokio::io::stdout(),
+            capture.clone(),
+        )),
+        tokio::spawn(tee(
+            child.stderr.take(),
+            tokio::io::stderr(),
+            capture.clone(),
+        )),
+    );
 
     let end = tokio::select! {
         result = child.wait() => ExecEnd::Exited(result),
@@ -245,50 +290,35 @@ async fn exec(spec: &JobSpec, ckpt_dirty: &std::sync::atomic::AtomicBool) -> Out
     };
     let exec_end = Utc::now();
 
-    match end {
-        ExecEnd::Exited(Ok(s)) if s.success() => Outcome {
-            status: JobStatus::Succeeded,
-            exit_code: Some(0),
-            error: None,
-            exec_start,
-            exec_end,
-            agent_exit_code: 0,
-        },
+    // Drain to EOF before finalizing: the child's last writes are still in flight in the
+    // pipe when `wait()` returns, and they are exactly the lines a reader wants most.
+    let log_path = finish_capture(capture, pumps).await;
+
+    let (status, exit_code, error, agent_exit_code) = match end {
+        ExecEnd::Exited(Ok(s)) if s.success() => (JobStatus::Succeeded, Some(0), None, 0),
         ExecEnd::Exited(Ok(s)) => {
             let code = s.code().unwrap_or(1);
-            Outcome {
-                status: JobStatus::Failed,
-                exit_code: Some(code),
-                error: None,
-                exec_start,
-                exec_end,
-                agent_exit_code: code.clamp(1, 255),
-            }
+            (JobStatus::Failed, Some(code), None, code.clamp(1, 255))
         }
-        ExecEnd::Exited(Err(e)) => Outcome {
-            status: JobStatus::AgentError,
-            exit_code: None,
-            error: Some(format!("wait failed: {e}")),
-            exec_start,
-            exec_end,
-            agent_exit_code: 4,
-        },
-        ExecEnd::Interrupted => Outcome {
-            status: JobStatus::Interrupted,
-            exit_code: None,
-            error: None,
-            exec_start,
-            exec_end,
-            agent_exit_code: 143,
-        },
-        ExecEnd::TimedOut => Outcome {
-            status: JobStatus::TimedOut,
-            exit_code: None,
-            error: None,
-            exec_start,
-            exec_end,
-            agent_exit_code: 7,
-        },
+        ExecEnd::Exited(Err(e)) => (
+            JobStatus::AgentError,
+            None,
+            Some(format!("wait failed: {e}")),
+            4,
+        ),
+        ExecEnd::Interrupted => (JobStatus::Interrupted, None, None, 143),
+        ExecEnd::TimedOut => (JobStatus::TimedOut, None, None, 7),
+    };
+    Outcome {
+        status,
+        exit_code,
+        error,
+        exec_start,
+        exec_end,
+        agent_exit_code,
+        // The same capture whatever the status: a failed or timed-out run's output is
+        // the most valuable thing it produced.
+        log_path,
     }
 }
 
@@ -300,7 +330,227 @@ fn agent_outcome(error: &str, exec_start: DateTime<Utc>) -> Outcome {
         exec_start,
         exec_end: Utc::now(),
         agent_exit_code: 4,
+        log_path: None,
     }
+}
+
+// ---- child output capture -------------------------------------------------
+
+/// Bytes of the child's output kept from the start of the run.
+const CAPTURE_HEAD_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Bytes kept from the end of the run once the head budget is spent. The *tail* is the half
+/// worth protecting: a run's results and its dying error are both at the end, and the tail
+/// is precisely what the org log query was losing.
+const CAPTURE_TAIL_BYTES: usize = 8 * 1024 * 1024;
+
+/// The child's merged stdout/stderr, captured to a file for upload.
+///
+/// Container stdout is only best-effort: it is queryable through SaladCloud's org log API
+/// for ~90 days, but that endpoint answers a bounded page at a time — the CLI has to
+/// bisect the time window to read a long run back — and stamps entries with the *node's*
+/// clock, so ordering across a skewed node is approximate. The run's inputs, outputs, and
+/// result envelope all travel through object storage, where nothing is capped or
+/// reordered; its output is the one artifact that did not. This makes it one too.
+///
+/// Bounded head + tail so a chatty job cannot fill the node's disk or push a multi-gigabyte
+/// upload: the first [`CAPTURE_HEAD_BYTES`] go straight to the file, and once that budget is
+/// spent the most recent [`CAPTURE_TAIL_BYTES`] are held in a ring and appended at the end,
+/// with a marker naming how much was dropped between the two.
+struct Capture {
+    path: PathBuf,
+    file: tokio::fs::File,
+    head_left: u64,
+    tail: std::collections::VecDeque<u8>,
+    tail_cap: usize,
+    dropped: u64,
+    /// Why capturing stopped, once a write to the file has failed.
+    ///
+    /// Load-bearing: a failed head write leaves `head_left` untouched, so without this
+    /// every later push re-enters the same failing branch, the tail never fills, and
+    /// [`Self::finish`] reports success on a log that silently ends mid-run.
+    failed: Option<String>,
+}
+
+impl Capture {
+    async fn create() -> Option<Self> {
+        // Deliberately not under the workdir: an output glob as ordinary as `*` would
+        // otherwise sweep the agent's own capture into the user's uploaded outputs.
+        let path = std::env::temp_dir().join(format!("sf-run-{}.log", std::process::id()));
+        match Self::open(path.clone(), CAPTURE_HEAD_BYTES, CAPTURE_TAIL_BYTES).await {
+            Ok(capture) => Some(capture),
+            Err(e) => {
+                // Not fatal: the run's output still reaches container stdout as before.
+                tracing::warn!("cannot capture run output to {}: {e}", path.display());
+                None
+            }
+        }
+    }
+
+    async fn open(path: PathBuf, head: u64, tail_cap: usize) -> std::io::Result<Self> {
+        let file = tokio::fs::File::create(&path).await?;
+        Ok(Self {
+            path,
+            file,
+            head_left: head,
+            tail: std::collections::VecDeque::new(),
+            tail_cap,
+            dropped: 0,
+            failed: None,
+        })
+    }
+
+    async fn push(&mut self, mut bytes: &[u8]) {
+        if self.failed.is_some() {
+            return;
+        }
+        if self.head_left > 0 {
+            let n = bytes
+                .len()
+                .min(usize::try_from(self.head_left).unwrap_or(usize::MAX));
+            if let Err(e) = self.file.write_all(&bytes[..n]).await {
+                // A full disk is the likely cause and it will not clear itself, so stop
+                // rather than retry every 8 KiB — but say so, here and in the file.
+                tracing::warn!(
+                    "capturing run output to {} failed: {e}",
+                    self.path.display()
+                );
+                self.failed = Some(e.to_string());
+                return;
+            }
+            self.head_left -= n as u64;
+            bytes = &bytes[n..];
+        }
+        self.tail.extend(bytes);
+        while self.tail.len() > self.tail_cap {
+            self.tail.pop_front();
+            self.dropped += 1;
+        }
+    }
+
+    /// Append the retained tail and get the bytes onto disk.
+    async fn finish(&mut self) -> std::io::Result<()> {
+        if let Some(reason) = self.failed.clone() {
+            // Upload what there is, but never let it read as a run that simply went quiet.
+            // Best-effort: the write that reports the failure can fail the same way.
+            let marker = format!("\n[sf-agent] output capture stopped early: {reason}\n");
+            let _ = self.file.write_all(marker.as_bytes()).await;
+            return self.file.flush().await;
+        }
+        if !self.tail.is_empty() {
+            // Only when something was actually lost: under the cap the tail continues the
+            // head byte-for-byte, and a marker there would invent a gap that is not present.
+            if self.dropped > 0 {
+                let marker = format!(
+                    "\n[sf-agent] {} bytes of output dropped from the middle of this log\n",
+                    self.dropped
+                );
+                self.file.write_all(marker.as_bytes()).await?;
+            }
+            let (front, back) = self.tail.as_slices();
+            self.file.write_all(front).await?;
+            self.file.write_all(back).await?;
+        }
+        // `flush` is the load-bearing one — tokio buffers writes and the upload reads this
+        // file back by path. `sync_all` is cheap insurance for the same reason the envelope
+        // is retried: a truncated log is worth less than no log at all.
+        self.file.flush().await?;
+        self.file.sync_all().await
+    }
+}
+
+/// Tee one of the child's streams: mirror it to the agent's matching fd (so it still reaches
+/// container stdout, which is what `saladfingers logs` reads) and copy it into the capture.
+async fn tee<R, W>(reader: Option<R>, mut sink: W, capture: Option<Arc<Mutex<Capture>>>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let Some(mut reader) = reader else { return };
+    let mut buf = vec![0u8; 8192];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                // Mirrored unbuffered: the platform's log shipper should see a line at the
+                // same moment it would have with an inherited fd.
+                let _ = sink.write_all(&buf[..n]).await;
+                let _ = sink.flush().await;
+                if let Some(capture) = &capture {
+                    capture.lock().await.push(&buf[..n]).await;
+                }
+            }
+        }
+    }
+}
+
+type Pumps = (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>);
+
+/// Drain both pipes to EOF (bounded by [`DRAIN_GRACE`]), then finalize the capture file.
+///
+/// The drain happens even with no capture file, because the pumps are also what mirror the
+/// child's output to container stdout: returning before they finish would drop whatever the
+/// child wrote last — the exact loss this whole path exists to prevent.
+async fn finish_capture(capture: Option<Arc<Mutex<Capture>>>, pumps: Pumps) -> Option<PathBuf> {
+    let (out, err) = pumps;
+    // Kept because dropping a `JoinHandle` only detaches the task; on timeout the pumps have
+    // to be stopped explicitly or they would keep appending past the tail marker below.
+    let (out_abort, err_abort) = (out.abort_handle(), err.abort_handle());
+    let drained = tokio::time::timeout(DRAIN_GRACE, async {
+        let _ = out.await;
+        let _ = err.await;
+    })
+    .await;
+    if drained.is_err() {
+        // Something still holds the write end open — typically a grandchild that inherited
+        // the pipe. Take what arrived rather than hanging the run.
+        out_abort.abort();
+        err_abort.abort();
+        tracing::warn!(
+            "child output still open {DRAIN_GRACE:?} after exit; capturing what arrived"
+        );
+    }
+
+    let capture = capture?;
+    let mut guard = capture.lock().await;
+    if let Err(e) = guard.finish().await {
+        tracing::warn!("finalizing captured run output failed: {e}");
+        return None;
+    }
+    Some(guard.path.clone())
+}
+
+/// Upload the captured output to the run's log slot.
+///
+/// `without_url`: like every other transfer-path request, the presigned signature must never
+/// reach error text — this one's failure is logged to container stdout, which is retained and
+/// queryable for ~90 days.
+///
+/// Rides `transfer_client` with **no** per-request deadline, deliberately. The rule this
+/// follows is the one `CONTROL_TIMEOUT` states: a fixed-size control document gets a
+/// deadline, a payload whose size is not known in advance does not, because any cap on how
+/// long a transfer may take is a cap on how large one may be. A capture is up to
+/// [`CAPTURE_HEAD_BYTES`] + [`CAPTURE_TAIL_BYTES`] of a chatty job's output, which is a
+/// payload, not a document. A storage endpoint that accepts the connection and never
+/// answers is caught instead by the connect timeout and TCP keepalive.
+///
+/// One attempt, unlike `put_envelope`'s three. The envelope is the run's contract and a
+/// missing one loses the work; the log is the best copy of something container stdout
+/// already has, and a retry loop over a 16 MiB body bills the node for every second of it.
+/// Failure here is warned about and ignored.
+async fn upload_log(http: &reqwest::Client, url: &str, path: &Path) -> Result<()> {
+    let body = tokio::fs::read(path)
+        .await
+        .with_context(|| format!("reading captured output {}", path.display()))?;
+    http.put(url)
+        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(body)
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)?
+        .error_for_status()
+        .map_err(reqwest::Error::without_url)?;
+    Ok(())
 }
 
 /// Forward the stop signal and wait out the grace period; SIGKILL if it expires.
@@ -976,6 +1226,32 @@ mod tests {
         // No match → empty; the caller turns this into a hard failure (never a silent skip).
         assert!(glob_outputs(w, "does/not/exist").unwrap().is_empty());
         assert!(glob_outputs(w, "nope-*.bin").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn capture_keeps_the_head_and_the_tail_and_names_the_gap() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Over the budget: the head is kept, the tail is kept, and the bytes lost between
+        // them are stated. The tail is the half that matters — it holds the run's results
+        // and, on a failure, the error that ended it.
+        let over = dir.path().join("over.log");
+        let mut cap = Capture::open(over.clone(), 4, 4).await.unwrap();
+        cap.push(b"HEADmiddle-droppedTAIL").await;
+        cap.finish().await.unwrap();
+        let got = std::fs::read_to_string(&over).unwrap();
+        assert!(got.starts_with("HEAD"), "{got:?}");
+        assert!(got.ends_with("TAIL"), "{got:?}");
+        assert!(got.contains("14 bytes of output dropped"), "{got:?}");
+
+        // Under the budget: byte-for-byte, with no marker inventing a gap that never
+        // happened — the overwhelmingly common case, and it must be an exact transcript.
+        let under = dir.path().join("under.log");
+        let mut cap = Capture::open(under.clone(), 4, 64).await.unwrap();
+        cap.push(b"HEAD").await;
+        cap.push(b"and the rest").await;
+        cap.finish().await.unwrap();
+        assert_eq!(std::fs::read_to_string(&under).unwrap(), "HEADand the rest");
     }
 
     #[tokio::test]
