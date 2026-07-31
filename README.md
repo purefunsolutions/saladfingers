@@ -22,13 +22,15 @@ project that needs real NVIDIA hardware for CUDA kernel testing, inference, and
 training — but nothing here is specific to that project.
 
 > Status: `run`, `session`, and `serve` modes are implemented and validated live on
-> SaladCloud GPUs. See `docs/` for the design and empirical findings.
+> SaladCloud GPUs; `run --expose-port` + `saladfingers tunnel` are implemented, live
+> validation pending. See `docs/` for the design and empirical findings.
 
 ## What it does
 
 - **`saladfingers run -- <cmd>`** — run a one-shot job on a rented GPU: create a
-  single-replica group, stream logs, ship artifacts to S3-compatible storage, and
-  delete the group. Billed ≈ the actual work.
+  single-replica group per shard, stream logs, ship artifacts to S3-compatible storage,
+  and delete the group. Billed ≈ the actual work. `--expose-port` puts a live port on the
+  running job behind the gateway, and `saladfingers tunnel` brings it to a local one.
 - **`saladfingers session`** — an interactive GPU dev box for fast iteration
   (`exec`, `cp`, `logs`) with an idle deadman so it never bills forgotten.
 - **`saladfingers serve`** — put an inference server behind the SaladCloud gateway
@@ -119,8 +121,8 @@ pushes them natively, with no Linux builder** — a Nix image is assembled from 
 binaries, so only the assembly glue has to be native. See [macos.md](docs/macos.md) for
 why, and [platforms.md](docs/platforms.md) for non-NixOS and no-Nix setups.
 
-Docs live under [`docs/`](docs/): SaladCloud facts, [session &
-serve](docs/serve.md) usage, image/layer policy, registry and storage runbooks,
+Docs live under [`docs/`](docs/): SaladCloud facts, [one-shot runs](docs/run.md) and
+[session & serve](docs/serve.md) usage, image/layer policy, registry and storage runbooks,
 [macOS](docs/macos.md) and [platform](docs/platforms.md) support, the empirical node
 findings, and the [security model](docs/security.md) — trust boundaries plus the two
 assumptions that follow from never putting a credential inside a container.

@@ -17,7 +17,7 @@ S3-compatible storage over HTTPS:
 
 | command | needs |
 | --- | --- |
-| `run`, `session`, `serve`, `attach`, `ls`, `logs`, `gc`, `cancel` | nothing but the binary |
+| `run`, `tunnel`, `session`, `serve`, `attach`, `ls`, `logs`, `gc`, `cancel` | nothing but the binary |
 | `doctor`, `gpu-classes`, `quotas`, `cost`, `bench`, `gpu-probe` | nothing but the binary |
 | `image push` | `nix` + `skopeo`, and a flake using the saladfingers flakeModule |
 
