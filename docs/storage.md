@@ -13,7 +13,11 @@ result envelopes, logs) can also use SaladCloud's S4 (100 MB/file, 30-day expiry
 
 Directory artifacts travel as a `tar | zstd` stream split into ≤ 4 GiB parts
 (`<name>.tzst.000`, `.001`, …) behind ordinary presigned PUTs — portable across every
-backend, no S3 multipart required.
+backend, no S3 multipart required. The zstd side is tunable per process:
+`SALADFINGERS_ZSTD_LEVEL` (1–22, default 3) and `SALADFINGERS_ZSTD_WINDOW_LOG` (10–31,
+also enables long-distance matching) — `saladfingers run --input-zstd-level` covers
+staged inputs from the CLI, and baking the variables into the image as `ENV` covers the
+agent's checkpoint/output uploads on the node.
 
 ## Artifact size limits
 

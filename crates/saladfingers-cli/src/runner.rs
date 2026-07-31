@@ -86,6 +86,17 @@ pub async fn run(cfg: Config, args: RunArgs) -> Result<()> {
         );
     }
 
+    // Staged `--input` files are the compressible payload (datasets that are
+    // not baked into the image), and they leave from HERE — the agent
+    // compresses checkpoints on the node, in a different process, so turning
+    // this up cannot cost training CPU.
+    transfer::set_compression(
+        Some(input_zstd_level(
+            args.input_zstd_level,
+            transfer::env_zstd_level(),
+        )),
+        args.input_zstd_window_log,
+    );
     eprintln!(
         "run {run_id}: uploading {} input(s)...",
         params.inputs.len()
@@ -1141,6 +1152,16 @@ fn summary(
     print_table(&t);
 }
 
+/// zstd level for `--input` uploads when neither the flag nor the env chooses:
+/// 19, not the library's 3 — see the flag's help for the measurements.
+const DEFAULT_INPUT_ZSTD_LEVEL: i32 = 19;
+
+/// Resolve `--input-zstd-level`: explicit flag, else a valid
+/// `SALADFINGERS_ZSTD_LEVEL`, else [`DEFAULT_INPUT_ZSTD_LEVEL`].
+fn input_zstd_level(flag: Option<i32>, env: Option<i32>) -> i32 {
+    flag.or(env).unwrap_or(DEFAULT_INPUT_ZSTD_LEVEL)
+}
+
 /// Host RAM in GiB when neither the flag nor the profile names one.
 const DEFAULT_MEMORY_GB: u32 = 16;
 
@@ -1424,6 +1445,23 @@ mod tests {
         }
     }
 
+    /// [`run_args`], but returning clap's error instead of exiting the process —
+    /// for asserting a flag is REFUSED (`parse_from` exits on error).
+    fn try_run_args(extra: &[&str]) -> Result<crate::cli::Cli, clap::Error> {
+        let mut argv = vec![
+            "saladfingers",
+            "run",
+            "--image",
+            "example.invalid/img:t",
+            "--gpu-class",
+            "rtx 4090 (24 gb)",
+        ];
+        argv.extend_from_slice(extra);
+        argv.extend_from_slice(&["--", "true"]);
+        use clap::Parser as _;
+        crate::cli::Cli::try_parse_from(argv)
+    }
+
     /// `--memory-gb` overrides the profile in BOTH directions.
     ///
     /// The direction that matters is DOWN, and it is the one a `max()` would get
@@ -1481,6 +1519,52 @@ mod tests {
             .to_string();
         assert!(e.contains("out of range"), "{e}");
         assert!(memory_mb(Some(40_000_000)).is_err(), "a fat-fingered zero");
+    }
+
+    /// `--input-zstd-level`: explicit flag, else a valid env value, else 19.
+    ///
+    /// The env leg is what a `default_value_t` would silently kill: with a
+    /// clap-side default the flag is always present, `set_compression` always
+    /// receives it, and `SALADFINGERS_ZSTD_LEVEL` could never reach a `run`
+    /// upload.
+    #[test]
+    fn input_zstd_level_prefers_the_flag_then_the_env_then_19() {
+        assert_eq!(input_zstd_level(Some(5), Some(9)), 5);
+        assert_eq!(input_zstd_level(None, Some(9)), 9);
+        assert_eq!(input_zstd_level(None, None), DEFAULT_INPUT_ZSTD_LEVEL);
+        // The clap side of the same rule: an absent flag must parse to None —
+        // any default here would shadow the env leg above.
+        assert_eq!(run_args(&[]).input_zstd_level, None);
+        assert_eq!(
+            run_args(&["--input-zstd-level", "7"]).input_zstd_level,
+            Some(7)
+        );
+        assert_eq!(run_args(&[]).input_zstd_window_log, None);
+        assert_eq!(
+            run_args(&["--input-zstd-window-log", "27"]).input_zstd_window_log,
+            Some(27)
+        );
+    }
+
+    /// Past clap, the tunables are stored unvalidated and the read side silently
+    /// falls through — an out-of-range flag must die at parse, loudly, not
+    /// quietly compress at some other level.
+    #[test]
+    fn an_out_of_range_input_zstd_flag_is_refused_at_parse_not_silently_defaulted() {
+        for (flag, bad, good) in [
+            ("--input-zstd-level", ["0", "23"], ["1", "22"]),
+            ("--input-zstd-window-log", ["9", "32"], ["10", "31"]),
+        ] {
+            for v in bad {
+                assert!(
+                    try_run_args(&[flag, v]).is_err(),
+                    "{flag} {v} must be refused"
+                );
+            }
+            for v in good {
+                assert!(try_run_args(&[flag, v]).is_ok(), "{flag} {v} must parse");
+            }
+        }
     }
 
     fn timings_at(start: DateTime<Utc>, exec_end_secs: i64, with_outputs: bool) -> Timings {
