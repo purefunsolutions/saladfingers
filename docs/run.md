@@ -111,6 +111,12 @@ saladfingers run --expose-port 8080 -- ./train --dashboard-addr '[::]:8080'
   `serve --proxy` the agent owns the `[::]` socket and the app binds loopback; with
   `--expose-port` there is no proxy, so your process is the gateway's upstream and binds
   `[::]` itself.
+- **The command also has to stay up.** `--expose-port` publishes a port; it does not make
+  anything listen on it, and a one-shot run ends when its command does. The trap is the
+  `sf-agent probe` baked into every image: it defaults to `--emit stdout`, so it prints
+  its report, exits 0, and the group is deleted — the gateway is gone before you can
+  reach it, which reads exactly like a broken tunnel. Serve it with
+  `sf-agent probe --emit http`.
 - The gateway's 100 s / 1 GB per-request caps apply here too (see
   [serve.md](serve.md#gateway-limits-why-it-works-this-way)).
 
@@ -185,6 +191,7 @@ saladfingers gc --older-than 24h --dry-run
 | --- | --- | --- |
 | browser gets **403** on the gateway URL | `--expose-port` is `auth=true` | `saladfingers tunnel RUN_ID` |
 | gateway answers **503** | the process bound `0.0.0.0` or loopback | bind `[::]:PORT` |
+| exposed run succeeds instantly, gateway never answers | the command printed and exited instead of serving | `sf-agent probe` needs `--emit http` |
 | run reports **exit 137** | host OOM killed the container | raise `--memory-gb` |
 | group loops `downloading → creating` | the image is not amd64, or the command replaced an entrypoint it needed | see [empirical.md](empirical.md) |
 | logs look thin or out of order | page cap, or node clock skew | widen `--since`, or use `--uploaded` |
