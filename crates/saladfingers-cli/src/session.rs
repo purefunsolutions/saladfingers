@@ -329,6 +329,9 @@ async fn logs_via_container(cfg: Config, name: &str) -> Result<()> {
         crate::cli::LogsArgs {
             run_id: name.to_string(),
             follow: false,
+            limit: 1000,
+            all: false,
+            since: "24h".to_string(),
         },
     )
     .await

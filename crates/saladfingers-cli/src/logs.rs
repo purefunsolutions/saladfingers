@@ -11,7 +11,7 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use saladfingers_api::{LogEntriesQuery, LogEntry, SaladClient};
 
@@ -19,12 +19,122 @@ use crate::cli::LogsArgs;
 use crate::config::Config;
 use crate::state;
 
+/// Entries one request can return. The endpoint validates `page_size` to `1..=100`
+/// (`PageSize` in the OpenAPI spec), so this is a hard ceiling per request, not a tunable —
+/// reaching more than 100 entries means issuing more than one request.
+const PAGE_SIZE: usize = 100;
+
+/// Stop bisecting once a window is this narrow. Below a couple of milliseconds a split no
+/// longer separates entries (a burst of lines shares one timestamp at this resolution), so
+/// further recursion would spin without making progress.
+const MIN_WINDOW_MS: i64 = 2;
+
+/// Ceiling on requests per group, so a pathological window cannot bisect indefinitely.
+///
+/// This bounds *wall time*, not rate-limit pressure: the client's own token bucket is
+/// `DEFAULT_RATE_PER_MIN = 180` (`saladfingers-api`), so 400 queries already exceeds one
+/// minute's budget and the last of them wait on the bucket. What it buys is a `logs` that
+/// gives up after a couple of throttled minutes instead of running until the operator does.
+/// `follow` re-enters this budget on every poll, so the aggregate over a long tail is
+/// bounded only by its own `FOLLOW_LIMIT` stopping each poll early.
+const MAX_QUERIES: usize = 400;
+
+/// Slack added to the end of the query window. Container-stdout timestamps are *node*
+/// assigned and node clocks skew by unpredictable amounts (E6: one node ran ~73 s off the
+/// control plane), so a node whose clock runs fast stamps its final lines in the future.
+/// Too little slack here excludes exactly the newest lines — the tail an operator opened
+/// the logs to read. Over-wide costs nothing but a few empty windows.
+const END_SLACK_MINUTES: i64 = 60;
+
 /// Server-side filter for one container group in SaladCloud's log query language.
 fn group_filter(name: &str) -> String {
     format!("resource.labels.container_group_name = \"{name}\"")
 }
 
-/// `saladfingers logs RUN_ID [--follow]`
+fn page_query(name: &str, start: DateTime<Utc>, end: DateTime<Utc>) -> LogEntriesQuery {
+    LogEntriesQuery {
+        start_time: start,
+        end_time: end,
+        query: group_filter(name),
+        page_size: Some(PAGE_SIZE as u32),
+        // Only load-bearing for a window that comes back full and can no longer be split:
+        // newest-first then keeps the tail rather than the head.
+        sort_order: Some("desc".to_string()),
+    }
+}
+
+/// Every log entry for one group within `[start, end]`, oldest first, plus whether the
+/// fetch stopped short of covering the whole window.
+///
+/// Pages by *window bisection*. A full page proves the window held at least a page worth of
+/// entries, but the API does not specify *which* of them it returns, so a full page is
+/// evidence to split on, not a trustworthy sample. A window that comes back short is
+/// unambiguous: it contained exactly what it returned. Splitting until every window is short
+/// therefore reconstructs the whole stream no matter which end the API truncates from.
+///
+/// This is the bug: the previous implementation issued exactly one 100-entry request per
+/// group and printed the result as "the most recent 100 lines", trusting `sort_order: desc`
+/// to mean the *newest* hundred. Nothing in the API contract promises that, and two RTX 5090
+/// benchmark runs (`sf-vf278i`, `sf-i1903a`) came back with their early sections intact and
+/// their final sections missing, with total output just past the 100-entry cap. Bisection
+/// drops the assumption instead of betting on it, and makes output past 100 entries
+/// reachable at all.
+///
+/// Windows are visited newest-first, so a binding `limit` keeps the *tail*.
+///
+/// # Errors
+/// Returns an error if a log query fails.
+pub async fn fetch_entries(
+    client: &SaladClient,
+    name: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    limit: usize,
+) -> Result<(Vec<LogEntry>, bool)> {
+    let mut stack = vec![(start, end)];
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<LogEntry> = Vec::new();
+    let mut queries = 0usize;
+    let mut truncated = false;
+
+    while let Some((ws, we)) = stack.pop() {
+        if out.len() >= limit || queries >= MAX_QUERIES {
+            truncated = true;
+            break;
+        }
+        queries += 1;
+        let entries = client.query_log_entries(&page_query(name, ws, we)).await?;
+        let full = entries.len() >= PAGE_SIZE;
+        if full && (we - ws) > Duration::milliseconds(MIN_WINDOW_MS) {
+            let mid = ws + (we - ws) / 2;
+            // Older half pushed first so the newer half pops first.
+            stack.push((ws, mid));
+            stack.push((mid + Duration::milliseconds(1), we));
+            continue;
+        }
+        // Either short (so complete) or too narrow to split further — keep what came back
+        // and admit the loss rather than presenting a partial window as the whole story.
+        truncated |= full;
+        // Reversed, because the page arrives newest-first and the final sort is *stable*:
+        // entries sharing a timestamp keep the order they were pushed in. MIN_WINDOW_MS
+        // exists precisely because a burst of lines shares one millisecond, so keeping the
+        // page's own order would print every such burst backwards.
+        for entry in entries.into_iter().rev() {
+            if seen.insert(entry_key(name, &entry)) {
+                out.push(entry);
+            }
+        }
+    }
+
+    out.sort_by_key(|e| e.time);
+    if out.len() > limit {
+        out.drain(..out.len() - limit);
+        truncated = true;
+    }
+    Ok((out, truncated))
+}
+
+/// `saladfingers logs RUN_ID [--follow] [--limit N] [--all] [--since DUR]`
 pub async fn logs(cfg: Config, args: LogsArgs) -> Result<()> {
     let client = cfg.client()?;
     let names = match state::load_run(&args.run_id)? {
@@ -35,30 +145,40 @@ pub async fn logs(cfg: Config, args: LogsArgs) -> Result<()> {
         return follow(&client, &names).await;
     }
 
-    let end = Utc::now() + Duration::minutes(5);
-    let start = end - Duration::hours(24);
+    let lookback = humantime::parse_duration(&args.since)
+        .with_context(|| format!("invalid --since '{}'", args.since))?;
+    let lookback = Duration::from_std(lookback).context("--since out of range")?;
+    let limit = if args.all { usize::MAX } else { args.limit };
+
+    let now = Utc::now();
+    let end = now + Duration::minutes(END_SLACK_MINUTES);
+    let start = now - lookback;
     for name in &names {
-        let query = LogEntriesQuery {
-            start_time: start,
-            end_time: end,
-            query: group_filter(name),
-            // The API caps page_size at 100. Fetch newest-first so a truncated snapshot
-            // keeps the tail (where a failed run's error is), then reverse for display.
-            page_size: Some(100),
-            sort_order: Some("desc".to_string()),
-        };
-        match client.query_log_entries(&query).await {
-            Ok(entries) if entries.is_empty() => {
-                eprintln!("no log entries for {name} (last 24 h)");
+        match fetch_entries(&client, name, start, end, limit).await {
+            // Only a fetch that actually covered the window may say "no entries" —
+            // an empty result that stopped on the entry cap or the query budget is a
+            // truncation, and the trailer's advice is the right message for it.
+            Ok((entries, truncated)) if entries.is_empty() && !truncated => {
+                eprintln!("no log entries for {name} (last {})", args.since);
             }
-            Ok(mut entries) => {
-                let truncated = entries.len() >= 100;
-                entries.reverse();
+            Ok((entries, truncated)) => {
                 for entry in &entries {
                     print_entry(name, entry);
                 }
                 if truncated {
-                    eprintln!("… most recent 100 lines for {name} (use --follow to tail)");
+                    // `--all` already lifted the entry cap, so advising it again would be
+                    // advice that does nothing: what stopped this fetch was the query
+                    // budget or a window too narrow to split.
+                    let remedy = if args.all {
+                        "narrow --since — this window needed more queries than one \
+                         invocation may spend"
+                    } else {
+                        "raise --limit, pass --all, or narrow --since"
+                    };
+                    eprintln!(
+                        "… newest {} entries for {name}; older output was cut ({remedy})",
+                        entries.len()
+                    );
                 }
             }
             Err(e) => eprintln!("log query for {name} failed: {e}"),
@@ -76,6 +196,10 @@ async fn follow(client: &SaladClient, names: &[String]) -> Result<()> {
     const LOOKBACK: i64 = 150; // seconds of history each poll
     const POLL_SECS: u64 = 4;
     const SEEN_CAP: usize = 5000;
+    /// Per-poll cap. A job that emits more than this in one lookback window is louder than
+    /// a human tail can follow anyway; the bound just keeps one poll from monopolizing the
+    /// rate limit.
+    const FOLLOW_LIMIT: usize = 2000;
 
     let mut seen: HashSet<String> = HashSet::new();
     let mut order: VecDeque<String> = VecDeque::new();
@@ -83,15 +207,10 @@ async fn follow(client: &SaladClient, names: &[String]) -> Result<()> {
         let end = Utc::now() + Duration::seconds(30);
         let start = end - Duration::seconds(LOOKBACK + 30);
         for name in names {
-            let query = LogEntriesQuery {
-                start_time: start,
-                end_time: end,
-                query: group_filter(name),
-                page_size: Some(100),
-                sort_order: Some("asc".to_string()),
-            };
-            match client.query_log_entries(&query).await {
-                Ok(entries) => {
+            // Paged like the one-shot path: a job logging faster than 100 lines per poll
+            // window would otherwise have the overflow silently dropped from the tail.
+            match fetch_entries(client, name, start, end, FOLLOW_LIMIT).await {
+                Ok((entries, _)) => {
                     for entry in &entries {
                         let key = entry_key(name, entry);
                         if seen.insert(key.clone()) {

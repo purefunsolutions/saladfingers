@@ -274,8 +274,20 @@ pub struct LogsArgs {
     /// Run identifier.
     pub run_id: String,
     /// Follow the log stream.
+    ///
+    /// Tails a rolling window of its own, so it takes neither `--since`, `--limit`,
+    /// nor `--all` — they are refused rather than silently ignored.
     #[arg(long)]
     pub follow: bool,
+    /// Print at most this many entries per group, keeping the newest.
+    #[arg(long, default_value_t = 1000, conflicts_with = "follow")]
+    pub limit: usize,
+    /// Print every entry in the window (no `--limit` cap).
+    #[arg(long, conflicts_with = "follow")]
+    pub all: bool,
+    /// How far back to search (e.g. `90m`, `6h`).
+    #[arg(long, default_value = "24h", conflicts_with = "follow")]
+    pub since: String,
 }
 
 #[derive(Debug, Args)]
