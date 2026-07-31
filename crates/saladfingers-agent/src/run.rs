@@ -195,7 +195,7 @@ pub async fn run(_args: RunArgs) -> Result<()> {
     timings.exec_start = Some(outcome.exec_start);
     timings.exec_end = Some(outcome.exec_end);
 
-    // Stop the watcher; it does one final upload of the now-settled checkpoint.
+    // Stop the watcher; it uploads until the checkpoint directory settles (bounded).
     if let Some(handle) = ckpt_watcher {
         ckpt_stop.notify_one();
         let _ = handle.await;

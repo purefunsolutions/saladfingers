@@ -59,6 +59,14 @@ struct Store {
     /// When set, metadata GETs answer 403 with this body — an expired URL, a bucket
     /// policy, or a backend that answers 403 for absent keys, depending on the text.
     forbid_meta_gets_with: Arc<Mutex<Option<String>>>,
+    /// A checkpoint directory to advance on the first data PUT, standing in for a trainer
+    /// that writes a new step while an upload is in flight.
+    advance_on_upload: Arc<Mutex<Option<(std::path::PathBuf, u64)>>>,
+    /// Every metadata object ever committed, in order. A later commit can repair an
+    /// earlier one's mistake, so "the last one is right" is not the property that matters —
+    /// each commit has to describe the bytes it was written over, because a node can die
+    /// after any of them and that is the one a resume will read.
+    commits: Arc<Mutex<Vec<CheckpointMeta>>>,
 }
 
 impl Store {
@@ -98,6 +106,8 @@ async fn storage() -> (String, Store) {
         ack_lost_meta: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         throttle_meta_gets: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         forbid_meta_gets_with: Arc::new(Mutex::new(None)),
+        advance_on_upload: Arc::new(Mutex::new(None)),
+        commits: Arc::new(Mutex::new(Vec::new())),
     };
     let app = Router::new()
         .route("/{*path}", any(handle))
@@ -161,6 +171,32 @@ async fn handle(
                 store.map.lock().unwrap().insert(path, body.to_vec());
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
+            // The trainer writing a new step while the upload is in flight. Fires on a
+            // data part, i.e. after the archive has been built — which is exactly when the
+            // old code re-read the step and mislabelled the bytes it had already captured.
+            // The mtime is pushed explicitly past the original files': on a filesystem
+            // with coarse timestamp granularity both writes could otherwise land in the
+            // same tick and the watcher's `mtime > prev` would never see the advance.
+            if path.contains("/data.")
+                && let Some((dir, step)) = store.advance_on_upload.lock().unwrap().take()
+            {
+                let inner = dir.join(format!("step_{step:08}"));
+                std::fs::create_dir_all(&inner).unwrap();
+                let file = inner.join("step.txt");
+                std::fs::write(&file, format!("step={step}")).unwrap();
+                let bumped = std::time::SystemTime::now() + Duration::from_millis(1500);
+                std::fs::File::options()
+                    .append(true)
+                    .open(&file)
+                    .unwrap()
+                    .set_modified(bumped)
+                    .unwrap();
+            }
+            if path.ends_with("meta.json")
+                && let Ok(meta) = serde_json::from_slice::<CheckpointMeta>(&body)
+            {
+                store.commits.lock().unwrap().push(meta);
+            }
             store.map.lock().unwrap().insert(path, body.to_vec());
             StatusCode::OK.into_response()
         }
@@ -201,6 +237,13 @@ async fn probe_restore(http: &reqwest::Client, spec: &JobSpec) -> anyhow::Result
 /// A JobSpec whose only meaningful field is a checkpoint spec pointing at `base`, with
 /// the checkpoint directory `dir` and a two-slot ring.
 fn spec_with_checkpoint(base: &str, dir: &str) -> JobSpec {
+    spec_with_interval(base, dir, 1)
+}
+
+/// [`spec_with_checkpoint`] with a chosen scan interval. An interval longer than the test
+/// runs means the *only* upload is the one the stop triggers, which is how the final-upload
+/// path gets exercised on its own.
+fn spec_with_interval(base: &str, dir: &str, interval_secs: u64) -> JobSpec {
     let dummy = format!("{base}/unused");
     let slots = (0..2)
         .map(|slot| {
@@ -231,7 +274,7 @@ fn spec_with_checkpoint(base: &str, dir: &str) -> JobSpec {
         outputs: vec![],
         checkpoint: Some(CheckpointSpec {
             glob: dir.to_string(),
-            interval_secs: 1,
+            interval_secs,
             quiesce_secs: 0, // always "settled" for the test
             slots,
             meta_put_url: format!("{base}/ckpt/meta.json?kind=put"),
@@ -482,6 +525,120 @@ async fn interrupted_upload_leaves_the_previous_checkpoint_intact() {
     assert_eq!(store.keys(), vec!["ckpt/meta.json", "ckpt/slot1/data.000"]);
 }
 
+/// The bug that lost a finished 30,000-step checkpoint: the step label was read *after*
+/// the transfer returned, so it described the directory as it stood by then rather than
+/// the bytes actually in the archive. The committed metadata then announced a step whose
+/// weights were not in the object, and `checkpoint fetch` returned the wrong ones with no
+/// error anywhere.
+///
+/// Here the store writes a newer step into the checkpoint directory while the upload is in
+/// flight. The metadata must describe what was archived, not what the directory says
+/// afterwards — and because this is the stop path, the newer state must still get its own
+/// upload rather than being lost with the watcher.
+#[tokio::test]
+async fn the_step_label_describes_the_bytes_that_were_archived() {
+    let (base, store) = storage().await;
+    let http = reqwest::Client::new();
+
+    let src = make_ckpt_dir(15_000, &[1u8; 4096]);
+    *store.advance_on_upload.lock().unwrap() = Some((src.path().to_path_buf(), 30_000));
+
+    watch_once(
+        &http,
+        &base,
+        src.path(),
+        RestoredState {
+            live: None,
+            had_remote: false,
+        },
+    )
+    .await;
+
+    // The FIRST commit is the one that matters here: a later pass can overwrite a bad
+    // label, but a node dying in between leaves exactly this object for the next run to
+    // resume from. It has to describe the archive it was written over, which held 15000 —
+    // the directory only reached 30000 after the tar was already built.
+    let commits = store.commits.lock().unwrap().clone();
+    assert_eq!(
+        commits.first().and_then(|m| m.step),
+        Some(15_000),
+        "the first commit labelled bytes it had never seen: {:?}",
+        commits.iter().map(|m| m.step).collect::<Vec<_>>()
+    );
+
+    // And the newer state is not lost with the watcher: the stop path's extra pass sees
+    // the mtime that landed during the final tar and uploads it too.
+    assert_eq!(
+        store.meta().step,
+        Some(30_000),
+        "the checkpoint written during the final upload was never uploaded"
+    );
+
+    // Whatever is committed at the end restores to something matching its own label.
+    let dst = tempfile::tempdir().unwrap();
+    probe_restore(
+        &http,
+        &spec_with_checkpoint(&base, &dst.path().to_string_lossy()),
+    )
+    .await
+    .expect("the committed checkpoint restores");
+    let labelled = store.meta().step.expect("a step was recorded");
+    assert!(
+        dst.path().join(format!("step_{labelled:08}")).is_dir(),
+        "metadata says step {labelled} but the archive does not contain it"
+    );
+}
+
+/// The stop path has no next interval, so whatever lands while the final archive is being
+/// built has nothing left to catch it — the watcher returns and the run moves on to its
+/// envelope. A checkpoint completed in the last seconds of a job is exactly the one worth
+/// keeping, so the final upload makes bounded extra passes until the directory settles.
+///
+/// The interval here is longer than the test runs, so the stop *is* the only upload and
+/// the repair cannot come from a periodic scan.
+#[tokio::test]
+async fn a_checkpoint_written_during_the_final_upload_is_not_lost_with_the_watcher() {
+    let (base, store) = storage().await;
+    let http = reqwest::Client::new();
+
+    let src = make_ckpt_dir(15_000, &[1u8; 4096]);
+    *store.advance_on_upload.lock().unwrap() = Some((src.path().to_path_buf(), 30_000));
+
+    let spec = spec_with_interval(&base, &src.path().to_string_lossy(), 3600);
+    let stop = Arc::new(Notify::new());
+    let handle = checkpoint::spawn_watcher(
+        http.clone(),
+        spec,
+        RestoredState {
+            live: None,
+            had_remote: false,
+        },
+        stop.clone(),
+        Arc::new(AtomicBool::new(false)),
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    stop.notify_one();
+    handle.await.unwrap();
+
+    let steps: Vec<Option<u64>> = store
+        .commits
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|m| m.step)
+        .collect();
+    assert_eq!(
+        steps.first().copied(),
+        Some(Some(15_000)),
+        "the final upload's label must describe what it archived: {steps:?}"
+    );
+    assert_eq!(
+        store.meta().step,
+        Some(30_000),
+        "a checkpoint that landed during the final upload was lost: {steps:?}"
+    );
+}
+
 /// A first life has nothing to reclaim, and must not go looking. The assertion needs the
 /// request log rather than the stored keys: deleting an absent key succeeds and leaves no
 /// trace, so a ring that wrongly marked every slot "unknown" on a fresh run would issue a
@@ -718,6 +875,55 @@ async fn a_rejected_signature_is_fatal_not_an_absent_checkpoint() {
     assert!(
         format!("{err:#}").contains("SignatureDoesNotMatch"),
         "the error should carry the code: {err:#}"
+    );
+}
+
+/// A force-killed child with writes fresher than the kill window likely died mid-write:
+/// the final upload is skipped, keeping the previous remote checkpoint, rather than
+/// committing a torn local directory over it. First coverage this branch has ever had —
+/// it was rewritten from an `if/else` into the stop-path pass loop, untested both times.
+#[tokio::test]
+async fn a_dirty_stop_with_fresh_writes_skips_the_final_upload() {
+    let (base, store) = storage().await;
+    let http = reqwest::Client::new();
+
+    // A committed checkpoint from mid-run, so there is something worth protecting.
+    let dir = make_ckpt_dir(10, &[1u8; 4096]);
+    let spec = spec_with_checkpoint(&base, &dir.path().to_string_lossy());
+    let stop = Arc::new(Notify::new());
+    let dirty = Arc::new(AtomicBool::new(false));
+    let handle = checkpoint::spawn_watcher(
+        http.clone(),
+        spec,
+        RestoredState {
+            live: None,
+            had_remote: false,
+        },
+        stop.clone(),
+        dirty.clone(),
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let committed = store.meta();
+    assert_eq!(committed.step, Some(10));
+
+    // The child is SIGKILLed mid-write: supervisor sets `dirty`, a file is seconds-fresh
+    // when the stop arrives.
+    let inner = dir.path().join("step_00000020");
+    std::fs::create_dir_all(&inner).unwrap();
+    std::fs::write(inner.join("step.txt"), "step=20").unwrap();
+    dirty.store(true, Ordering::SeqCst);
+    stop.notify_one();
+    handle.await.unwrap();
+
+    let meta = store.meta();
+    assert_eq!(
+        meta.step,
+        Some(10),
+        "a torn final directory must not be committed over the last good checkpoint"
+    );
+    assert_eq!(
+        meta.sha256, committed.sha256,
+        "the committed metadata must be untouched by the dirty stop"
     );
 }
 
