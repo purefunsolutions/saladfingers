@@ -123,6 +123,7 @@ pub async fn create(cfg: Config, args: SessionCreateArgs) -> Result<()> {
         profile: args.profile.clone(),
         image: Some(image),
         gpu_classes: gpu_classes.clone(),
+        gpu_observed: None,
         priority: Some(priority_str),
         command: vec![],
         output_names: None,
@@ -165,6 +166,10 @@ pub async fn create(cfg: Config, args: SessionCreateArgs) -> Result<()> {
     if let Some(g) = run.groups.first_mut() {
         g.last_state = Some("running".into());
     }
+    // Record which GPU this actually landed on, while the agent is connected and the box
+    // is alive: SaladCloud will never tell us (see `RunState::gpu_observed`), and once the
+    // group is deleted there is nothing left to ask.
+    run.gpu_observed = observe_gpu(&agent).await;
     state::save_run(&run)?;
 
     // Self-exit does not stop billing (the platform relaunches the container on every
@@ -280,12 +285,122 @@ pub async fn ls(_cfg: Config, args: ReadArgs) -> Result<()> {
         t.add_row(vec![
             s.run_id.clone(),
             s.status.clone(),
-            s.gpu_classes.first().cloned().unwrap_or_default(),
+            gpu_cell(s),
             s.created_at.format("%Y-%m-%d %H:%M").to_string(),
         ]);
     }
     println!("{t}");
     Ok(())
+}
+
+/// What the `gpu` column may honestly claim about a session.
+///
+/// Printing `gpu_classes.first()` was wrong whenever the request was a first-available
+/// list: `--gpu-class A --gpu-class B` renders as `A` on a box that is really a `B`, and
+/// the operator has no way to tell. A single requested class is safe (the placement can
+/// only have been that one); several are not, so say so rather than pick.
+fn gpu_cell(s: &state::RunState) -> String {
+    if let Some(observed) = &s.gpu_observed {
+        return observed.clone();
+    }
+    match s.gpu_classes.as_slice() {
+        [] => String::new(),
+        [only] => only.clone(),
+        many => format!("? (1 of {} requested)", many.len()),
+    }
+}
+
+/// Ask the node what GPU it actually has, for [`state::RunState::gpu_observed`].
+///
+/// Best effort by construction: the caller has a working session and must not lose it
+/// over a table column, so every failure — no `nvidia-smi` (a CPU-only or ROCm image),
+/// an exec the agent refuses, unparsable output — returns `None` and leaves the honest
+/// fallback in [`gpu_cell`] to explain itself.
+async fn observe_gpu(agent: &AgentClient) -> Option<String> {
+    let out = exec_capture(
+        agent,
+        vec![
+            "nvidia-smi".into(),
+            "--query-gpu=name,memory.total".into(),
+            "--format=csv,noheader".into(),
+        ],
+    )
+    .await
+    .ok()?;
+    parse_smi_gpu(&out)
+}
+
+/// `NVIDIA GeForce RTX 2060, 12288 MiB` → `RTX 2060 (12 GB)`.
+///
+/// Normalized into the vocabulary `gpu-classes` uses, so the column reads the same
+/// whether the value was observed or echoed from the request. The VRAM matters: it is
+/// what distinguishes the near-duplicate classes (`RTX 3060 (8 GB)` vs `(12 GB)`).
+fn parse_smi_gpu(out: &str) -> Option<String> {
+    let line = out.lines().find(|l| !l.trim().is_empty())?;
+    let (name, mem) = line.split_once(',')?;
+    let name = name
+        .trim()
+        .trim_start_matches("NVIDIA GeForce ")
+        .trim_start_matches("NVIDIA ")
+        .trim();
+    if name.is_empty() {
+        return None;
+    }
+    let mib: u64 = mem.split_whitespace().next()?.parse().ok()?;
+    // Round to the nearest GB: cards report a usable 12288/8192 MiB, and the class names
+    // are written in whole GB.
+    Some(format!("{name} ({} GB)", mib.div_ceil(1024)))
+}
+
+/// Run one command in a session and collect its stdout.
+///
+/// The streaming [`exec`] path writes straight to this process's stdout and exits with
+/// the remote code, which is right for an interactive command and useless for a caller
+/// that wants the bytes back.
+async fn exec_capture(agent: &AgentClient, argv: Vec<String>) -> Result<String> {
+    let created: ExecCreated = agent
+        .json(
+            Method::POST,
+            agent_api::route::EXEC,
+            Some(&ExecRequest {
+                argv,
+                workdir: None,
+                env: None,
+            }),
+        )
+        .await
+        .context("starting exec")?;
+
+    let mut out = String::new();
+    let mut cursor = 0u64;
+    // Bounded rather than `loop`: a command that never exits must not hang the caller
+    // (here, `session create`) forever.
+    for _ in 0..8 {
+        let page: OutputPage = agent
+            .json::<(), _>(
+                Method::GET,
+                &format!(
+                    "{}?cursor={cursor}&wait_ms={OUTPUT_WAIT_MS}",
+                    agent_api::route::exec_output(&created.exec_id)
+                ),
+                None,
+            )
+            .await
+            .context("polling exec output")?;
+        for chunk in &page.chunks {
+            if matches!(chunk.stream, agent_api::Stream::Stdout) {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&chunk.data_b64)
+                    .unwrap_or_default();
+                out.push_str(&String::from_utf8_lossy(&bytes));
+            }
+        }
+        cursor = page.next_cursor;
+        if page.exited {
+            return Ok(out);
+        }
+    }
+    bail!("exec did not finish")
 }
 
 /// `saladfingers session logs NAME [EXEC]`
@@ -726,6 +841,83 @@ fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn session_state(gpu_classes: &[&str], observed: Option<&str>) -> state::RunState {
+        state::RunState {
+            v: 1,
+            run_id: "sf-x7k2mq".into(),
+            kind: "session".into(),
+            created_at: Utc::now(),
+            org: "my-org".into(),
+            project: "my-proj".into(),
+            profile: None,
+            image: Some("img@sha256:abc".into()),
+            gpu_classes: gpu_classes.iter().map(|s| (*s).to_string()).collect(),
+            gpu_observed: observed.map(str::to_string),
+            priority: Some("batch".into()),
+            command: vec![],
+            output_names: None,
+            max_parts: None,
+            groups: vec![],
+            status: "running".into(),
+            agent_token: None,
+            max_duration_secs: None,
+            result: None,
+        }
+    }
+
+    /// The bug this replaced: a first-available list rendered its FIRST entry as though
+    /// it were the allocation. Measured live — `--gpu-class 'GTX 1650 (4 GB)'` first, on
+    /// a box that was really an RTX 2060 — and the column said `GTX 1650 (4 GB)`.
+    #[test]
+    fn the_gpu_column_never_names_a_card_the_placement_may_not_have_used() {
+        let many = session_state(&["GTX 1650 (4 GB)", "RTX 2060 (6 GB)"], None);
+        let cell = gpu_cell(&many);
+        assert!(!cell.contains("GTX 1650"), "{cell}");
+        assert_eq!(cell, "? (1 of 2 requested)");
+    }
+
+    /// One requested class needs no hedging: the placement can only have been that one.
+    #[test]
+    fn a_single_requested_class_is_reported_plainly() {
+        assert_eq!(
+            gpu_cell(&session_state(&["RTX 3060 (12 GB)"], None)),
+            "RTX 3060 (12 GB)"
+        );
+        assert_eq!(gpu_cell(&session_state(&[], None)), "");
+    }
+
+    /// Once the node has been asked, its answer wins over any request.
+    #[test]
+    fn an_observed_gpu_beats_the_requested_list() {
+        let s = session_state(
+            &["GTX 1650 (4 GB)", "RTX 2060 (6 GB)"],
+            Some("RTX 2060 (12 GB)"),
+        );
+        assert_eq!(gpu_cell(&s), "RTX 2060 (12 GB)");
+    }
+
+    #[test]
+    fn smi_output_normalizes_into_the_gpu_class_vocabulary() {
+        assert_eq!(
+            parse_smi_gpu("NVIDIA GeForce RTX 2060, 12288 MiB\n").as_deref(),
+            Some("RTX 2060 (12 GB)")
+        );
+        assert_eq!(
+            parse_smi_gpu("NVIDIA GeForce GTX 1650, 4096 MiB").as_deref(),
+            Some("GTX 1650 (4 GB)")
+        );
+        // A card reporting slightly under a whole GB still names its marketed size —
+        // 11264 MiB is an "11 GB" 2080 Ti, and rounding down would invent a 10 GB class.
+        assert_eq!(
+            parse_smi_gpu("NVIDIA GeForce RTX 2080 Ti, 11000 MiB").as_deref(),
+            Some("RTX 2080 Ti (11 GB)")
+        );
+        // Anything unparsable is None, never a half-formed label.
+        assert_eq!(parse_smi_gpu(""), None);
+        assert_eq!(parse_smi_gpu("no such command"), None);
+        assert_eq!(parse_smi_gpu("NVIDIA GeForce RTX 2060, [N/A]"), None);
+    }
 
     #[test]
     fn parse_remote_distinguishes_sessions_from_local_paths() {

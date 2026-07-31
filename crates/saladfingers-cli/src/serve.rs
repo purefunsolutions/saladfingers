@@ -109,6 +109,7 @@ pub async fn up(cfg: Config, args: ServeUpArgs) -> Result<()> {
         profile: args.profile.clone(),
         image: Some(image),
         gpu_classes: gpu_classes.clone(),
+        gpu_observed: None,
         priority: Some(priority_str),
         command: args.command.clone(),
         output_names: None,

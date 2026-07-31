@@ -1516,6 +1516,7 @@ fn save_state(cfg: &Config, run_id: &str, params: &RunParams, groups: &[GroupRef
         profile: params.name_hint.clone(),
         image: Some(params.image.clone()),
         gpu_classes: params.gpu_classes.clone(),
+        gpu_observed: None,
         priority: Some(params.priority.clone()),
         command: params.command.clone(),
         // Record the declared output names so `attach` (which reconstructs from state) can
@@ -1940,6 +1941,7 @@ mod tests {
             profile: None,
             image: None,
             gpu_classes: vec!["rtx 4090".into()],
+            gpu_observed: None,
             priority: Some("batch".into()),
             command: vec![],
             output_names: None,

@@ -43,6 +43,21 @@ pub struct RunState {
     /// GPU classes requested (names as given).
     #[serde(default)]
     pub gpu_classes: Vec<String>,
+    /// The GPU the node actually turned out to have, once something has looked.
+    ///
+    /// SaladCloud never reports which class a group was placed on: the container-group
+    /// object echoes back the *requested* `gpu_classes` UUID list and the instance object
+    /// carries only lifecycle fields (verified against the live API). So with a
+    /// first-available list of several classes, the allocation is knowable only by asking
+    /// the node — and that answer is worth persisting, because it cannot be recovered once
+    /// the group is gone. `None` = nobody has looked yet, or the look failed.
+    ///
+    /// It is an observation of the box that came up, not a standing truth. That is safe
+    /// here because a session which relaunches elsewhere comes back with a fresh `boot_id`
+    /// and its reaper deletes the group, so the reading cannot quietly describe a machine
+    /// the session no longer runs on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_observed: Option<String>,
     /// Priority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
@@ -381,6 +396,7 @@ mod tests {
             profile: Some("kernels".into()),
             image: Some("img@sha256:abc".into()),
             gpu_classes: vec!["rtx 4090".into()],
+            gpu_observed: None,
             priority: Some("batch".into()),
             command: vec!["true".into()],
             output_names: Some(vec!["model".into(), "ckpt".into()]),
