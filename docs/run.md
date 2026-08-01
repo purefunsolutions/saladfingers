@@ -68,10 +68,53 @@ saladfingers run --input ./corpus.tar:/work/corpus --output 'ckpts/latest/**:mod
   filesystem is fresh on every start, on same-node restarts and across reallocation
   alike. A `--checkpoint` directory in object storage is the only persistence a long run
   has.
+- The agent restores the checkpoint before the command starts and re-uploads it as it
+  changes, **alternating between two slots** so a node dying mid-upload leaves the
+  previous checkpoint complete and still current. If it cannot restore one that exists,
+  the run **fails instead of starting over** — retraining from step 0 would overwrite the
+  checkpoint on its first commit, which is the loss the alternation exists to prevent.
 - Size ceilings (`max_artifact_parts × 4 GiB`), the decompression-bomb guard, and the
   zstd tunables are storage policy, not run policy — see [storage.md](storage.md).
 - A startup bandwidth gate reallocates a node too slow to be worth keeping before the
   work starts; `--no-gate` skips it.
+
+## Getting a checkpoint back
+
+```sh
+saladfingers checkpoint show sf-x7k2mq                  # step, size, age — no download
+saladfingers checkpoint fetch sf-x7k2mq --dest ./ckpt
+```
+
+- **`--output` is the wrong tool for this.** Outputs are collected only when a job
+  finishes cleanly, which is exactly when the checkpoint matters least. A run cut short
+  at step 21,000 left 21,000 steps of work in the bucket, and `checkpoint fetch` is how
+  you get it — after the run ended, after its groups are gone.
+- The current checkpoint's key depends on how many times the run rotated slots, so it is
+  not guessable by hand. `show` reads the metadata object that resolves it; `fetch`
+  verifies the sha256 before extracting anything.
+
+### Resuming in a *later* run
+
+```sh
+saladfingers run … --checkpoint /work/ckpt --checkpoint-prefix tinystories-77m -- ./train
+# the node dies at step 21,000; run the same command again and it continues from there
+saladfingers checkpoint rm --prefix tinystories-77m     # when you want it gone (prompts)
+```
+
+- Without a name, a checkpoint lives inside the run's own storage, where the next run's
+  fresh id could not address it — right for a one-shot job, backwards for training.
+  **`--checkpoint-prefix <name>`** stores it in a run-independent location instead
+  (`prefix` under `[profiles.<name>.checkpoint]` does the same), and one run holds a name
+  at a time — `run` refuses a prefix a live local run already claims.
+- **No run-level cleanup ever touches a shared checkpoint** — that is what makes it
+  shared — so `checkpoint rm --prefix` is the only thing that removes one.
+- A profile's `prefix` applies to the profile's own checkpoint directory. Overriding the
+  directory with `--checkpoint` on the command line does *not* inherit it, because
+  retention is one checkpoint: a scratch run's first commit would delete the real one.
+  Pass `--checkpoint-prefix` explicitly to aim a different directory at a shared name.
+
+Key layout, retention, the slot ring, and exactly when run-scoped storage is cleaned up
+are in [storage.md](storage.md).
 
 ## Shards (`--replicas N`)
 
@@ -79,15 +122,19 @@ saladfingers run --input ./corpus.tar:/work/corpus --output 'ckpts/latest/**:mod
 saladfingers run --replicas 4 -- ./shard-worker
 saladfingers logs sf-x7k2mq --uploaded --shard 2
 saladfingers tunnel sf-x7k2mq --shard 2
+saladfingers checkpoint show sf-x7k2mq --shard 2
 ```
 
 - **A shard is a whole single-replica container group, not a replica.** SaladCloud offers
   **no per-instance routing** ([salad-facts.md](salad-facts.md)), so addressing a
   particular node means giving it a group of its own. That constraint is the reason the
-  word "shard" exists here, and the reason `tunnel` and `logs --uploaded` take `--shard`.
+  word "shard" exists here, and the reason `tunnel`, `logs --uploaded`, and
+  `checkpoint show|fetch` all take `--shard`.
 - Groups are named `sf-<id>` for a single shard and `sf-<id>-0…N-1` for several. Each
   shard gets its own job spec, its own storage prefix `runs/<run-id>/<shard>/`, its own
-  result envelope, and — with `--expose-port` — its own gateway URL.
+  result envelope, its own checkpoint ring, and — with `--expose-port` — its own gateway
+  URL. Shards do not collide under a shared `--checkpoint-prefix` either; each keeps its
+  own ring under the name.
 - The command sees `SF_SHARD_INDEX` and `SF_SHARD_COUNT`. Splitting the work is the job's
   business; saladfingers only fans out.
 
@@ -196,6 +243,9 @@ saladfingers gc --older-than 24h --dry-run
 | group loops `downloading → creating` | the image is not amd64, or the command replaced an entrypoint it needed | see [empirical.md](empirical.md) |
 | logs look thin or out of order | page cap, or node clock skew | widen `--since`, or use `--uploaded` |
 | "Access Denied, Check Permissions" | private image, no pull credentials | set the `[registry]` env vars; `run` now refuses before creating anything |
+| run exits **1**, envelope error starts "checkpoint restore:" | a checkpoint is there but unreadable — usually a CLI/agent version mismatch | `saladfingers checkpoint show <run-id>` (or `--prefix <name>`) to see what is stored; upgrade whichever side is older, or `checkpoint rm --prefix` to start clean |
+| "already using checkpoint prefix" | another local run claims that name | `saladfingers cancel` it, pick another name, or delete its state file — the message names it |
+| `checkpoint show` says no checkpoint for a run that had one | the run wrote to a shared prefix, or `gc` reaped the run | the error names the prefix if local state knows it; otherwise `--prefix <name>` |
 
 A green exit code is the *node's* report of what happened, not a proof — see
 [security.md](security.md), Assumption 1.

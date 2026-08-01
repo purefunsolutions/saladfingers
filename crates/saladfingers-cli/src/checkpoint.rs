@@ -38,7 +38,7 @@ const EXPIRY: Duration = Duration::from_secs(6 * 3600);
 /// three unreachable arms, one of which would have produced the key `runs//0/ckpt`.
 #[derive(Debug, Clone)]
 pub enum Target {
-    /// The checkpoint stored inside a run, which `gc` reaps with the run.
+    /// The checkpoint stored inside a run, sharing the run's storage lifecycle.
     Run(String),
     /// A shared checkpoint, addressed by name and outliving every run that writes it.
     Prefix(String),

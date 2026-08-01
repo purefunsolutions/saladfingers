@@ -22,7 +22,8 @@ project that needs real NVIDIA hardware for CUDA kernel testing, inference, and
 training — but nothing here is specific to that project.
 
 > Status: `run`, `session`, and `serve` modes are implemented and validated live on
-> SaladCloud GPUs; `run --expose-port` + `saladfingers tunnel` are implemented, live
+> SaladCloud GPUs; `run --expose-port` + `saladfingers tunnel`, and the checkpoint slot
+> ring with `--checkpoint-prefix` + `saladfingers checkpoint`, are implemented, live
 > validation pending. See `docs/` for the design and empirical findings.
 
 ## What it does
@@ -31,6 +32,11 @@ training — but nothing here is specific to that project.
   single-replica group per shard, stream logs, ship artifacts to S3-compatible storage,
   and delete the group. Billed ≈ the actual work. `--expose-port` puts a live port on the
   running job behind the gateway, and `saladfingers tunnel` brings it to a local one.
+  `--checkpoint` survives losing the node; `--checkpoint-prefix` lets the *next* run
+  resume from it.
+- **`saladfingers checkpoint show|fetch|rm`** — inspect, download, or delete the
+  checkpoint a run left in storage, including a run that never finished. That is usually
+  the valuable one: `--output` only ever fires when a job completes cleanly.
 - **`saladfingers session`** — an interactive GPU dev box for fast iteration
   (`exec`, `cp`, `logs`) with an idle deadman so it never bills forgotten.
 - **`saladfingers serve`** — put an inference server behind the SaladCloud gateway

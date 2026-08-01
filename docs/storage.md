@@ -45,26 +45,8 @@ data.
 
 ## Checkpoints
 
-By default a run's checkpoint lives under `runs/<run-id>/<shard>/ckpt/`, which means it is
-reaped together with the run. That is right for a one-shot job and wrong for training: a
-30k-step run that dies at step 21,000 has three quarters of the work in the bucket, and the
-next run's fresh id would leave it unreachable. `--checkpoint-prefix <name>` (or
-`prefix` under `[profiles.<name>.checkpoint]`) moves it to `ckpts/<name>/<shard>/` instead —
-a run-independent location that the next `--checkpoint-prefix <name>` run restores from
-automatically and that `gc` does not touch, since `gc` only reaps under `runs/`.
-
-```bash
-saladfingers run … --checkpoint /work/ckpts --checkpoint-prefix tinystories-77m …
-# a later run with the same prefix picks up where that one stopped
-saladfingers checkpoint show --prefix tinystories-77m
-```
-
-Only one run may hold a prefix at a time — two runs rotating one slot ring would overwrite
-each other's checkpoints — so `run` refuses a prefix a live local run already claims. That
-check reads local run state, so it catches the same-operator mistake, not a run launched
-from another machine.
-
-The layout is the same either way:
+A shard's checkpoint lives under `runs/<run-id>/<shard>/ckpt/`, laid out as a two-slot
+ring:
 
 ```
 <base>/meta.json          the commit record — which slot is current, its step and sha256
@@ -87,12 +69,47 @@ the CLI rather than by guessing a key:
 ```bash
 saladfingers checkpoint show sf-x7k2mq                     # step, size, age — no download
 saladfingers checkpoint fetch sf-x7k2mq --dest ./ckpt
-saladfingers checkpoint fetch --prefix tinystories-77m     # the shared one
+saladfingers checkpoint fetch --prefix tinystories-77m     # the shared one (below)
 ```
 
 `fetch` verifies the sha256 before extracting anything. It works after the run has ended and
 after its container groups are gone — which is the point, since the checkpoint of an
 interrupted run is worth more than the output of a finished one.
+
+### Shared checkpoints (`--checkpoint-prefix`)
+
+Under `runs/<run-id>/` the checkpoint shares the run's storage lifecycle, and the next
+run's fresh id could not address it anyway. That is right for a one-shot job and wrong
+for training: a 30k-step run that dies at step 21,000 has three quarters of the work in
+the bucket. `--checkpoint-prefix <name>` (or `prefix` under
+`[profiles.<name>.checkpoint]`) moves the ring to `ckpts/<name>/<shard>/` instead — a
+run-independent location that the next `--checkpoint-prefix <name>` run restores from
+automatically.
+
+```bash
+saladfingers run … --checkpoint /work/ckpts --checkpoint-prefix tinystories-77m …
+# a later run with the same prefix picks up where that one stopped
+saladfingers checkpoint show --prefix tinystories-77m
+```
+
+Only one run may hold a prefix at a time — two runs rotating one slot ring would overwrite
+each other's checkpoints — so `run` refuses a prefix a live local run already claims. That
+check reads local run state, so it catches the same-operator mistake, not a run launched
+from another machine.
+
+Cleanup differs by design. A run-scoped checkpoint goes whenever `runs/<run-id>/` goes —
+today that is `gc`, which removes a run's storage when it reaps that run's leaked group
+(a run the CLI cleaned up after normally keeps its objects until then). A shared one is
+outside `runs/` entirely — that is what makes it shared — so **no run-level cleanup ever
+touches it**, and removing one takes saying so:
+
+```bash
+saladfingers checkpoint rm --prefix tinystories-77m   # every shard; prompts, --yes skips
+```
+
+Worth knowing before you re-shard: `rm` and the ring both work per shard, so a 4-shard run
+followed by a 2-shard run on the same name leaves shards 2 and 3 behind, holding weights no
+command will mention again. `rm` clears the whole name, which is the way out.
 
 ## Options
 
