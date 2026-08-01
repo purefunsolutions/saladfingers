@@ -104,6 +104,9 @@ pub enum Command {
     Reap(RunIdArgs),
     /// Query a run's logs (works after group deletion).
     Logs(LogsArgs),
+    /// Inspect, download, or delete an uploaded checkpoint.
+    #[command(subcommand)]
+    Checkpoint(CheckpointCommand),
     /// Garbage-collect leftover container groups.
     Gc(GcArgs),
     /// Interactive GPU dev session.
@@ -297,6 +300,11 @@ pub struct RunArgs {
     /// A checkpoint uploads once no file changed within this many seconds.
     #[arg(long, default_value_t = 15)]
     pub checkpoint_quiesce: u64,
+    /// Store the checkpoint under a shared name instead of inside this run, so a later
+    /// run with the same name resumes from it (e.g. `--checkpoint-prefix tinystories-77m`).
+    /// Without it the checkpoint is reaped together with the run that wrote it.
+    #[arg(long, value_name = "NAME")]
+    pub checkpoint_prefix: Option<String>,
     /// Create the groups and return immediately.
     #[arg(long)]
     pub detach: bool,
@@ -347,6 +355,59 @@ pub struct LogsArgs {
     /// the platform query covers every shard's group at once.
     #[arg(long, default_value_t = 0, requires = "uploaded")]
     pub shard: u32,
+}
+
+/// Checkpoint subcommands.
+///
+/// The agent writes checkpoints into a rotating slot, so which key holds the current one
+/// is not predictable from the run id alone — the metadata object is the index, and these
+/// commands are how an operator reads it.
+#[derive(Debug, Subcommand)]
+pub enum CheckpointCommand {
+    /// Show the uploaded checkpoint's metadata (step, size, age) without downloading it.
+    Show(CheckpointArgs),
+    /// Download and extract the uploaded checkpoint.
+    Fetch(CheckpointFetchArgs),
+    /// Delete a shared checkpoint. `gc` never reaps these — that is what makes them
+    /// shared — so this is the only way to remove one.
+    Rm(CheckpointRmArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CheckpointRmArgs {
+    /// Shared checkpoint name, as passed to `run --checkpoint-prefix`. Every shard's copy
+    /// goes with it.
+    #[arg(long, value_name = "NAME")]
+    pub prefix: String,
+    /// Skip the confirmation prompt.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+#[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("ckpt-target").required(true).args(["run_id", "prefix"])))]
+pub struct CheckpointArgs {
+    /// Run identifier (e.g. `sf-x7k2mq`) — reads the checkpoint stored inside that run.
+    pub run_id: Option<String>,
+    /// Shared checkpoint name, as passed to `run --checkpoint-prefix`. Reads the
+    /// run-independent checkpoint instead, which is the one that outlives its run.
+    #[arg(long, value_name = "NAME")]
+    pub prefix: Option<String>,
+    /// Shard whose checkpoint to read.
+    #[arg(long, default_value_t = 0)]
+    pub shard: u32,
+    /// Emit JSON instead of a table.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CheckpointFetchArgs {
+    #[command(flatten)]
+    pub target: CheckpointArgs,
+    /// Directory to extract into. Defaults to `./sf-out/<run-id-or-prefix>/<shard>/ckpt`.
+    #[arg(long)]
+    pub dest: Option<String>,
 }
 
 #[derive(Debug, Args)]

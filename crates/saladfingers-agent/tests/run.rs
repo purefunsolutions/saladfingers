@@ -26,7 +26,7 @@ async fn mount_result_endpoints(server: &MockServer) {
 
 fn job_spec(server_uri: &str, command: Vec<&str>) -> Value {
     json!({
-        "v": 1,
+        "v": saladfingers_protocol::PROTOCOL_VERSION,
         "run_id": "sf-test01",
         "shard_index": 0,
         "shard_count": 1,
@@ -83,7 +83,7 @@ async fn run_succeeds_and_writes_envelope() {
     assert_eq!(env["status"], "succeeded");
     assert_eq!(env["exit_code"], 0);
     assert_eq!(env["run_id"], "sf-test01");
-    assert_eq!(env["v"], 1);
+    assert_eq!(env["v"], saladfingers_protocol::PROTOCOL_VERSION);
 }
 
 #[tokio::test]
@@ -166,7 +166,7 @@ async fn run_downloads_input_and_uploads_output() {
     // The agent runs in this workdir and produces out.txt from the input.
     let work = tempfile::tempdir().unwrap();
     let job = json!({
-        "v": 1, "run_id": "sf-io0001", "shard_index": 0, "shard_count": 1,
+        "v": saladfingers_protocol::PROTOCOL_VERSION, "run_id": "sf-io0001", "shard_index": 0, "shard_count": 1,
         "command": ["sh", "-c", "cp data.txt out.txt"],
         "workdir": work.path().to_str().unwrap(),
         "inputs": [{
@@ -229,7 +229,7 @@ async fn run_short_circuits_when_already_succeeded() {
     let server = MockServer::start().await;
     // A prior terminal envelope exists → the agent must NOT run the command.
     let prior = json!({
-        "v": 1, "run_id": "sf-test01", "shard_index": 0,
+        "v": saladfingers_protocol::PROTOCOL_VERSION, "run_id": "sf-test01", "shard_index": 0,
         "status": "succeeded", "exit_code": 0,
         "timings": {"agent_start": "2026-07-17T12:00:00Z"},
         "node": {}, "uploads": [], "attempts": 1, "gate_reallocations": 0
@@ -271,7 +271,7 @@ async fn run_stops_reexecuting_a_failing_job_once_the_attempt_cap_is_spent() {
     let work = tempfile::tempdir().unwrap();
     let count_file = work.path().join("count");
     let spec = json!({
-        "v": 1,
+        "v": saladfingers_protocol::PROTOCOL_VERSION,
         "run_id": "sf-cap01",
         "shard_index": 0,
         "shard_count": 1,
@@ -342,7 +342,7 @@ async fn run_uploads_the_childs_complete_output_and_still_mirrors_it() {
     let script = "i=0; while [ $i -lt 250 ]; do echo \"line $i\"; i=$((i+1)); done; \
                   echo 'on-stderr' >&2; echo 'FINAL LINE'";
     let job = json!({
-        "v": 1, "run_id": "sf-log001", "shard_index": 0, "shard_count": 1,
+        "v": saladfingers_protocol::PROTOCOL_VERSION, "run_id": "sf-log001", "shard_index": 0, "shard_count": 1,
         "command": ["sh", "-c", script],
         "workdir": work.path().to_str().unwrap(),
         "urls": {
@@ -402,7 +402,7 @@ async fn a_failed_run_still_uploads_its_output() {
     let work = tempfile::tempdir().unwrap();
 
     let job = json!({
-        "v": 1, "run_id": "sf-log002", "shard_index": 0, "shard_count": 1,
+        "v": saladfingers_protocol::PROTOCOL_VERSION, "run_id": "sf-log002", "shard_index": 0, "shard_count": 1,
         "command": ["sh", "-c", "echo 'boom happened' >&2; exit 3"],
         "workdir": work.path().to_str().unwrap(),
         "urls": {
@@ -427,4 +427,138 @@ async fn a_failed_run_still_uploads_its_output() {
         .cloned()
         .expect("a failed run still uploads its output");
     assert!(String::from_utf8_lossy(&uploaded).contains("boom happened"));
+}
+
+/// A checkpoint that exists but cannot be restored must stop the run, not start it over.
+///
+/// Continuing is what the old code did, and it destroys the thing it was protecting: the
+/// ring no longer knows which slot is live, so the next upload can land on the committed
+/// slot — and even when it rotates correctly, the commit that follows reclaims the other
+/// one. Either way the checkpoint the operator still had is gone, and the job silently
+/// retrains from step 0 while the metadata says otherwise.
+///
+/// The unreadable checkpoint here is a v1 metadata object, which is what an older agent
+/// leaves behind. The job's command would create a marker file; it must never run. The
+/// spec also carries an input whose URL 404s: the probe must fail the boot BEFORE the
+/// input download (exit 6, not the input path's exit 4) — a permanently bad checkpoint
+/// must not re-pay the full input transfer on every relaunch of a doomed run. And the
+/// metadata URL carries a fake signature, so the no-leak assertion can actually fail.
+#[tokio::test]
+async fn an_unreadable_checkpoint_stops_the_run_instead_of_retraining_from_zero() {
+    let (base, store) = storage_server().await;
+    let http = reqwest::Client::new();
+    let work = tempfile::tempdir().unwrap();
+    let marker = work.path().join("the-job-ran");
+    let input_dest = work.path().join("never-downloaded.txt");
+
+    let slot_urls = |slot: u32| {
+        json!({
+            "put_urls": [format!("{base}/ckpt/slot{slot}/data.000")],
+            "get_urls": [format!("{base}/ckpt/slot{slot}/data.000")],
+            "delete_urls": [format!("{base}/ckpt/slot{slot}/data.000")],
+        })
+    };
+    let sig = "?X-Amz-Signature=deadbeefcafef00d&X-Amz-Credential=AKID%2Ftest";
+    let job = json!({
+        "v": saladfingers_protocol::PROTOCOL_VERSION, "run_id": "sf-ckpt01", "shard_index": 0, "shard_count": 1,
+        "command": ["sh", "-c", format!("touch {}", marker.display())],
+        "workdir": work.path().to_str().unwrap(),
+        "inputs": [{
+            "name": "in/input0",
+            "urls": [format!("{base}/in/absent.tzst.000")],
+            "dest": input_dest.to_str().unwrap(),
+            "archive": false
+        }],
+        "checkpoint": {
+            "glob": "ckpt",
+            "interval_secs": 1,
+            "quiesce_secs": 0,
+            "slots": [slot_urls(0), slot_urls(1)],
+            "meta_put_url": format!("{base}/ckpt/meta.json{sig}"),
+            "meta_get_url": format!("{base}/ckpt/meta.json{sig}"),
+        },
+        "urls": {
+            "result_put": format!("{base}/result.json"), "result_get": format!("{base}/result.json"),
+            "attempts_put": format!("{base}/attempts.json"), "attempts_get": format!("{base}/attempts.json"),
+            "log_put": format!("{base}/log.txt")
+        }
+    });
+    // A checkpoint written by an agent one protocol version back: readable enough to know
+    // it is there, not readable enough to resume from.
+    let v1_meta = json!({
+        "v": 1, "parts": 1, "bytes": 4096,
+        "sha256": "0".repeat(64), "uploaded_at": "2026-07-01T00:00:00Z",
+    });
+    for (key, value) in [("job.json", &job), ("ckpt/meta.json", &v1_meta)] {
+        http.put(format!("{base}/{key}"))
+            .body(serde_json::to_vec(value).unwrap())
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let output = spawn_agent(&format!("{base}/job.json")).await;
+    assert_eq!(
+        output.status.code(),
+        Some(6),
+        "exit 6 (checkpoint), not 4 (inputs): the probe must run before the download; \
+         stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "the job ran anyway — it would have retrained from step 0 over a live checkpoint"
+    );
+    assert!(
+        !input_dest.exists(),
+        "the input was downloaded before the checkpoint was probed — a doomed relaunch \
+         re-pays the whole input transfer"
+    );
+
+    let raw = store
+        .lock()
+        .unwrap()
+        .get("result.json")
+        .cloned()
+        .expect("the reason must reach the CLI, not just the node's logs");
+    let env: Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(env["status"], "agent_error");
+    let error = env["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("checkpoint restore") && error.contains("protocol v1"),
+        "the envelope should name the cause: {error}"
+    );
+    assert!(
+        !error.contains("X-Amz-Signature") && !error.contains("deadbeef"),
+        "a presigned URL leaked into the stored envelope: {error}"
+    );
+}
+
+/// The version field exists to make a mismatched CLI/agent pair fail loudly at boot.
+/// Field-level serde only catches a skew whose shapes differ — a spec with no checkpoint
+/// block is byte-identical across v1 and v2 — so the check has to be explicit, and this
+/// pins that it is: same spec, wrong `v`, exit 3 without running anything.
+#[tokio::test]
+async fn a_job_spec_from_another_protocol_version_is_refused_at_boot() {
+    let server = MockServer::start().await;
+    mount_result_endpoints(&server).await;
+    let mut spec = job_spec(&server.uri(), vec!["sh", "-c", "exit 0"]);
+    spec["v"] = json!(saladfingers_protocol::PROTOCOL_VERSION - 1);
+    Mock::given(method("GET"))
+        .and(path("/job"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(spec))
+        .mount(&server)
+        .await;
+
+    let output = spawn_agent(&format!("{}/job", server.uri())).await;
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "a version skew is a spec problem: exit 3, before any work"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("protocol v1") && stderr.contains("v2"),
+        "the log should name both versions: {stderr}"
+    );
 }

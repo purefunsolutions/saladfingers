@@ -76,8 +76,16 @@ computed somewhere you trust.
 ## Assumption 2 — presigned URLs are long-lived capabilities that cannot be revoked
 
 The `JobSpec` handed to each run contains every presigned URL that run needs: input GETs,
-output PUTs, checkpoint PUT/GETs, the gate probe, and the attempts/result PUT+GET. The spec
-itself is fetched through a presigned GET passed to the container as `SF_JOB_URL`.
+output PUTs, checkpoint PUT/GET/**DELETE**s, the log PUT, the gate probe, and the
+attempts/result PUT+GET. The spec itself is fetched through a presigned GET passed to the container as
+`SF_JOB_URL`.
+
+The DELETEs are the one destructive verb in the set, and they are there because retention
+is one checkpoint: after committing a new one the agent removes the slot it superseded,
+and it holds no credentials with which to do that any other way. They are scoped to the
+checkpoint slot keys this spec already writes — the run's own, or the shared name's under
+`--checkpoint-prefix` (below) — the same objects its PUTs already overwrite, so they add
+no reach, only a way to lose data faster than an overwrite would.
 
 Lifetime is deliberately generous, because the agent may still need to upload hours later
 after a reallocation, long after the CLI process is gone:
@@ -99,10 +107,18 @@ The blast radius is bounded: URLs are scoped to specific object keys under
 `runs/<run_id>/`, not to the bucket, so a leaked spec exposes that run's objects and
 nothing else.
 
+**`--checkpoint-prefix` widens that one boundary, deliberately.** A shared checkpoint
+lives under `ckpts/<name>/` rather than the run, so a leaked spec from *any* run using
+that name carries PUT/GET/DELETE over the shared checkpoint — including runs that have not
+started yet. That is the same trade the feature exists to make (the checkpoint outliving
+its run is the point), but it means a shared name is only as private as the least careful
+run that uses it. `gc` does not reap these; `saladfingers checkpoint rm --prefix` does.
+
 **Guidance.** Treat a `JobSpec` as a secret — it is a bundle of live capabilities, not
 metadata. If one leaks, rotate the storage credentials named by `[storage] access_key_env` / `secret_key_env`; that invalidates outstanding URLs across all runs.
-`saladfingers gc` removes a finished run's remote objects, which closes the window early
-for that run.
+`saladfingers gc` removes a run's remote objects when it reaps that run's leaked group,
+closing the window early for it — a run that completed normally keeps its objects (and
+their URLs' targets) until then, so credential rotation is the remedy that always works.
 
 ## Known limitations and testing status
 

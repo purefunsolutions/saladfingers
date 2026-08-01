@@ -92,6 +92,12 @@ min_upload_mbps = 10.0
 [profiles.train.checkpoint]
 dir = "ckpts"
 interval_secs = 120
+# A shared checkpoint name lifts the checkpoint out of the run that wrote it, so the
+# NEXT run of this profile resumes from it instead of starting over. Without one the
+# checkpoint lives inside the run's own storage, where the next run cannot reach it.
+# Delete a shared one with `saladfingers checkpoint rm --prefix <name>`; no run-level
+# cleanup ever touches these.
+# prefix = "tinystories-77m"
 
 [profiles.train.artifacts]
 push = ["ckpts/latest/**"]

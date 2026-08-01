@@ -77,6 +77,16 @@ pub struct RunState {
     /// state file, or a non-`run` deployment); the collector then falls back to the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_parts: Option<u32>,
+    /// Shared checkpoint name this run reads and writes, if any (`--checkpoint-prefix`).
+    ///
+    /// Recorded so a second run cannot be aimed at a prefix a live run is already rotating
+    /// — two writers sharing one slot ring would overwrite each other's checkpoints. It
+    /// also lets `checkpoint show RUN_ID` say where the checkpoint actually went when the
+    /// run's own prefix holds nothing, as a hint in the error; addressing it still takes
+    /// `--prefix`, because a command that read local state to pick a different key would
+    /// behave differently on every machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_prefix: Option<String>,
     /// The container groups backing this run.
     #[serde(default)]
     pub groups: Vec<GroupRef>,
@@ -173,6 +183,13 @@ impl RunState {
             .sum()
     }
 }
+
+/// Serializes tests that point `XDG_STATE_HOME` at a tempdir. Env vars are process-global
+/// and `set_var` is unsafe with concurrent threads: under nextest each test is its own
+/// process and the lock is moot, but under plain `cargo test` two state-mutating tests in
+/// one binary would otherwise race each other's directories.
+#[cfg(test)]
+pub(crate) static TEST_STATE_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The base state directory (`$XDG_STATE_HOME/saladfingers` or `~/.local/state/saladfingers`).
 ///
@@ -380,8 +397,10 @@ mod tests {
 
     #[test]
     fn run_state_round_trips_through_disk() {
+        let _env = TEST_STATE_ENV.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        // SAFETY: single-threaded test; scopes state to the tempdir.
+        // SAFETY: serialized by TEST_STATE_ENV against the other state-mutating tests;
+        // scopes state to the tempdir.
         unsafe {
             std::env::set_var("XDG_STATE_HOME", dir.path());
         }
@@ -401,6 +420,7 @@ mod tests {
             command: vec!["true".into()],
             output_names: Some(vec!["model".into(), "ckpt".into()]),
             max_parts: Some(64),
+            checkpoint_prefix: None,
             groups: vec![GroupRef {
                 name: "sf-x7k2mq".into(),
                 shard: 0,

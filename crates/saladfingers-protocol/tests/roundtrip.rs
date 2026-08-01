@@ -10,9 +10,13 @@ use std::collections::BTreeMap;
 use chrono::{TimeZone, Utc};
 use saladfingers_protocol::{
     JobSpec, JobStatus, NodeInfo, PROTOCOL_VERSION, ResultEnvelope, Timings, UploadReport,
+    VersionProbe,
     agent_api::{ExecRequest, Health, OutputChunk, OutputPage, Stream},
     envelope::{AttemptRecord, Attempts},
-    job::{BandwidthGate, CheckpointSpec, ControlUrls, TransferIn, TransferOut},
+    job::{
+        BandwidthGate, CheckpointMeta, CheckpointSlot, CheckpointSpec, ControlUrls, TransferIn,
+        TransferOut,
+    },
 };
 
 fn roundtrip<T>(value: &T)
@@ -65,10 +69,20 @@ fn jobspec_full_roundtrip() {
             glob: "ckpts/step_*".into(),
             interval_secs: 60,
             quiesce_secs: 15,
-            put_urls: vec!["https://s3.example/latest.000".into()],
+            slots: vec![
+                CheckpointSlot {
+                    put_urls: vec!["https://s3.example/slot0.000".into()],
+                    get_urls: vec!["https://s3.example/slot0.000?get".into()],
+                    delete_urls: vec!["https://s3.example/slot0.000?del".into()],
+                },
+                CheckpointSlot {
+                    put_urls: vec!["https://s3.example/slot1.000".into()],
+                    get_urls: vec!["https://s3.example/slot1.000?get".into()],
+                    delete_urls: vec!["https://s3.example/slot1.000?del".into()],
+                },
+            ],
             meta_put_url: "https://s3.example/meta?put".into(),
             meta_get_url: "https://s3.example/meta?get".into(),
-            get_urls: vec!["https://s3.example/latest.000?get".into()],
         }),
         bandwidth_gate: Some(BandwidthGate {
             min_download_mbps: Some(50.0),
@@ -112,6 +126,59 @@ fn jobspec_minimal_omits_optionals() {
         "absent optionals must be omitted: {json}"
     );
     roundtrip(&spec);
+}
+
+/// The checkpoint metadata is a wire message in both directions — the agent writes it, its
+/// own restore path reads it back on a *different node*, and the CLI reads it days later —
+/// so it belongs here with the other wire types rather than being covered only in passing
+/// v2 has no v1 senders to tolerate, so a slot's GET and DELETE lists are required —
+/// defaulted-empty they are silently wrong in both directions (restore reports "no
+/// parts" for a checkpoint that exists; reclaim "succeeds" while deleting nothing).
+/// This is the test that keeps a stray `#[serde(default)]` from coming back.
+#[test]
+fn a_slot_without_its_get_or_delete_urls_is_refused_at_decode() {
+    for json in [
+        r#"{"put_urls":["u"]}"#,
+        r#"{"put_urls":["u"],"get_urls":["u"]}"#,
+        r#"{"put_urls":["u"],"delete_urls":["u"]}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<CheckpointSlot>(json).is_err(),
+            "an incomplete slot must fail loudly at decode: {json}"
+        );
+    }
+}
+
+/// by whichever integration test happened to store one.
+#[test]
+fn checkpoint_meta_roundtrip() {
+    let meta = CheckpointMeta {
+        v: PROTOCOL_VERSION,
+        slot: 1,
+        parts: 3,
+        bytes: 12_884_901_888,
+        sha256: "a".repeat(64),
+        step: Some(21_000),
+        uploaded_at: Utc.with_ymd_and_hms(2026, 7, 24, 3, 4, 5).unwrap(),
+    };
+    roundtrip(&meta);
+
+    // `step` is the one optional: a job whose checkpoint layout reveals no step number
+    // must not serialize a null that a stricter reader would reject.
+    let json = serde_json::to_string(&CheckpointMeta {
+        step: None,
+        ..meta.clone()
+    })
+    .unwrap();
+    assert!(
+        !json.contains("step"),
+        "absent step must be omitted: {json}"
+    );
+
+    // The version is what a reader probes before decoding, so it has to be present and
+    // addressable without the rest of the object parsing.
+    let probe: VersionProbe = serde_json::from_str(&json).expect("probe decodes");
+    assert_eq!(probe.v, PROTOCOL_VERSION);
 }
 
 #[test]
