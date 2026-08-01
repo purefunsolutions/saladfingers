@@ -593,7 +593,10 @@ struct AgentClient {
 
 impl AgentClient {
     fn new(base: String, api_key: String, token: String) -> Result<Self> {
-        let http = reqwest::Client::builder()
+        // Carries both the operator's API key (for the gateway) and the session bearer
+        // (for the agent) on every request — see the builder for why a redirect must not
+        // take either anywhere else.
+        let http = saladfingers_protocol::transfer::credentialed_client_builder()
             .timeout(Duration::from_secs(180))
             .build()?;
         Ok(Self {
@@ -709,7 +712,7 @@ pub(crate) async fn probe_boot_id(
 ) -> Option<String> {
     let group = client.get_container_group(name).await.ok()?;
     let gateway = group.gateway_url()?;
-    let http = reqwest::Client::builder()
+    let http = saladfingers_protocol::transfer::credentialed_client_builder()
         .timeout(Duration::from_secs(15))
         .build()
         .ok()?;

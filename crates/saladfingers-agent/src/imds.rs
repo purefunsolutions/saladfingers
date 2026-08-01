@@ -46,7 +46,9 @@ impl ImdsClient {
             .ok()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_BASE.to_string());
-        let http = reqwest::Client::builder()
+        // Credential-safe builder: IMDS hands back a workload JWT, so a redirect off the
+        // link-local address would mean accepting one minted by whoever it pointed at.
+        let http = saladfingers_protocol::transfer::credentialed_client_builder()
             .timeout(Duration::from_secs(20))
             .no_proxy()
             .build()

@@ -239,6 +239,60 @@ const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 /// connection, dropped peer) must not torch a whole multi-part artifact.
 const MAX_TRANSFER_ATTEMPTS: u32 = 4;
 
+/// How many same-host redirects a credentialed client will follow before giving up.
+///
+/// A service may legitimately move a path within itself; five hops is plenty for that,
+/// and anything longer is a loop. Load-bearing for [`transfer_client`], which deliberately
+/// has no total timeout: without this cut-off a self-redirecting endpoint would spin the
+/// client forever.
+const MAX_SAME_HOST_REDIRECTS: usize = 5;
+
+/// A [`reqwest::ClientBuilder`] with this workspace's credential-safety policy applied.
+/// Callers add their own timeouts on top.
+///
+/// **Every client that carries a credential must start here.** Two ways a redirect leaks
+/// one, both verified against reqwest rather than assumed:
+///
+/// - **A custom header survives a cross-host redirect.** reqwest strips only the standard
+///   sensitive names (`AUTHORIZATION`, `COOKIE`, `PROXY_AUTHORIZATION`, …). `Salad-Api-Key`
+///   and the agent's bearer token are custom, so with the default policy — follow up to ten
+///   — one 3xx hands them to whatever host it names.
+/// - **`Referer` carries the previous URL, query and all.** For a presigned URL the query
+///   *is* the credential (`X-Amz-Signature=…`), so following a redirect from one publishes
+///   a live storage capability to the redirect target. reqwest sets `Referer` by default;
+///   this turns it off.
+///
+/// The policy is therefore: follow a redirect that stays on the same origin, because a
+/// service may legitimately move a path; refuse one that crosses to another origin, by
+/// name, because no legitimate case needs it and every case leaks. A presigned URL is
+/// signed for one host anyway, so a followed cross-host redirect could not have
+/// authenticated — it could only have handed the signature over.
+///
+/// (`tunnel` is the one deliberate exception and does not use this: a reverse proxy must
+/// hand a 3xx back to the browser rather than resolve it, so it sets `Policy::none()` and
+/// rewrites the `Location`. Same reasoning, different correct answer.)
+pub fn credentialed_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .referer(false)
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let same_origin = attempt.previous().last().is_some_and(|prev| {
+                prev.scheme() == attempt.url().scheme()
+                    && prev.host_str() == attempt.url().host_str()
+                    && prev.port_or_known_default() == attempt.url().port_or_known_default()
+            });
+            if !same_origin {
+                attempt.error(
+                    "refusing a redirect to a different host: this request carries a \
+                     credential that would travel with it",
+                )
+            } else if attempt.previous().len() > MAX_SAME_HOST_REDIRECTS {
+                attempt.error("too many redirects")
+            } else {
+                attempt.follow()
+            }
+        }))
+}
+
 /// An HTTP client tuned for large artifact transfers.
 ///
 /// No total-request deadline, and — because this client serves uploads too —
@@ -264,10 +318,13 @@ const MAX_TRANSFER_ATTEMPTS: u32 = 4;
 /// mechanisms that watch the CONNECTION rather than the transfer's duration,
 /// and so cannot confuse a big upload with a broken one.
 ///
+/// Every URL this client fetches is presigned, i.e. the URL itself is the credential, so
+/// it takes the redirect and `Referer` policy from [`credentialed_client_builder`].
+///
 /// # Errors
 /// Returns an error if the TLS backend fails to initialize.
 pub fn transfer_client() -> reqwest::Result<reqwest::Client> {
-    reqwest::Client::builder()
+    credentialed_client_builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .tcp_keepalive(TCP_KEEPALIVE)
         .build()
@@ -764,6 +821,166 @@ mod tests {
         assert_eq!(part_key("x", 0), "x.tzst.000");
         assert_eq!(part_key("x", 7), "x.tzst.007");
         assert_eq!(part_key("dir/x", 123), "dir/x.tzst.123");
+    }
+
+    /// A redirect must not carry a credential to another host — and for these clients the
+    /// credential is the URL itself, so `Referer` is a leak channel as surely as a header.
+    /// A reqwest `Client` exposes neither setting, so both are shown by behaviour: a
+    /// second host that records what it receives must record nothing at all.
+    ///
+    /// Same-origin redirects are still followed, because a service may legitimately move
+    /// a path and refusing that would be a regression with no security benefit.
+    #[tokio::test]
+    async fn a_credentialed_client_refuses_a_cross_host_redirect_and_sends_no_referer() {
+        use std::sync::{Arc, Mutex};
+
+        // Host B: records every request it is handed.
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host_b = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
+            let recorder = Arc::clone(&recorder);
+            async move {
+                recorder.lock().unwrap().push(
+                    headers
+                        .get("referer")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string),
+                );
+                "landed"
+            }
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // Host A: `/away` leaves for host B, `/home` redirects within itself. What lands
+        // on `/arrived` is recorded too, because the same-origin follow is the ONLY
+        // request reqwest would ever attach a `Referer` to — host B can never observe
+        // the header, since the whole point is that host B is never reached.
+        let arrived: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let arrived_rec = Arc::clone(&arrived);
+        let away_to = format!("{host_b}/collect");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host_a = format!("http://{}", listener.local_addr().unwrap());
+        use axum::response::IntoResponse as _;
+        let app = axum::Router::new().fallback(
+            move |uri: axum::http::Uri, headers: axum::http::HeaderMap| {
+                let away_to = away_to.clone();
+                let arrived_rec = Arc::clone(&arrived_rec);
+                async move {
+                    match uri.path() {
+                        "/away" => (
+                            axum::http::StatusCode::FOUND,
+                            [(axum::http::header::LOCATION, away_to)],
+                        )
+                            .into_response(),
+                        "/home" => (
+                            axum::http::StatusCode::FOUND,
+                            [(axum::http::header::LOCATION, "/arrived".to_string())],
+                        )
+                            .into_response(),
+                        _ => {
+                            arrived_rec.lock().unwrap().push(
+                                headers
+                                    .get("referer")
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(str::to_string),
+                            );
+                            "arrived".into_response()
+                        }
+                    }
+                }
+            },
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let http = transfer_client().unwrap();
+
+        // The URL stands in for a presigned one: its query IS the credential.
+        let signed = format!("{host_a}/away?X-Amz-Signature=deadbeefcafef00d");
+        let err = http
+            .get(&signed)
+            .send()
+            .await
+            .expect_err("a cross-host redirect must be refused, not followed");
+        assert!(
+            format!("{err}").contains("different host") || err.is_redirect(),
+            "unexpected error: {err}"
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the other host was contacted at all — the signed URL travelled with the request"
+        );
+
+        // Same origin still works, and still sends no Referer.
+        let resp = http
+            .get(format!("{host_a}/home?X-Amz-Signature=deadbeefcafef00d"))
+            .send()
+            .await
+            .expect("a same-origin redirect is legitimate and must still be followed");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "arrived");
+        // The follow that just happened is the one request that could carry a `Referer`
+        // — and the URL it would repeat has a live signature in its query.
+        let arrived = arrived.lock().unwrap();
+        assert_eq!(
+            arrived.len(),
+            1,
+            "exactly one request must land on /arrived"
+        );
+        assert_eq!(
+            arrived[0], None,
+            "the same-origin follow carried a Referer — `.referer(false)` is gone from \
+             the builder, and with it the query of every presigned URL a redirect touches"
+        );
+    }
+
+    /// The loop cap is the one line of the redirect policy the other tests cannot see —
+    /// and for this client it guards against an infinite hang, not just waste:
+    /// [`transfer_client`] deliberately has no total timeout, so without the cap a
+    /// self-redirecting endpoint would spin it forever.
+    #[tokio::test]
+    async fn a_same_origin_redirect_loop_is_cut_at_the_cap() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        use axum::response::IntoResponse as _;
+        let app = axum::Router::new().fallback(move || {
+            let counter = Arc::clone(&counter);
+            async move {
+                // Terminate eventually even with the cap broken, so a regression fails
+                // the assertions below instead of hanging the test.
+                if counter.fetch_add(1, Ordering::SeqCst) >= 25 {
+                    return "escaped".into_response();
+                }
+                (
+                    axum::http::StatusCode::FOUND,
+                    [(axum::http::header::LOCATION, "/loop".to_string())],
+                )
+                    .into_response()
+            }
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let http = transfer_client().unwrap();
+        let err = http
+            .get(format!("{base}/loop"))
+            .send()
+            .await
+            .expect_err("a same-origin redirect loop must be cut, not followed forever");
+        assert!(
+            format!("{err}").contains("too many redirects") || err.is_redirect(),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            MAX_SAME_HOST_REDIRECTS + 1,
+            "the cap allows the original request plus MAX_SAME_HOST_REDIRECTS follows"
+        );
     }
 
     #[test]

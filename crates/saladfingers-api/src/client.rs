@@ -101,7 +101,7 @@ impl SaladClient {
     /// # Errors
     /// Returns [`ApiError::Network`] if the underlying HTTP client cannot be built.
     pub fn new(cfg: SaladClientConfig) -> Result<Self, ApiError> {
-        let http = reqwest::Client::builder()
+        let http = crate::http::credentialed_client_builder()
             .timeout(Duration::from_secs(60))
             .user_agent(concat!("saladfingers/", env!("CARGO_PKG_VERSION")))
             .build()?;

@@ -132,7 +132,9 @@ async fn try_s4_upload(token: &str, org: &str) -> Result<()> {
 
 async fn measure_download(url: &str, mb: u64) -> Result<f64> {
     let wanted = mb * 1024 * 1024;
-    let client = reqwest::Client::builder()
+    // The gate URL is presigned — the URL is the credential — so no redirect may carry
+    // it, and `Referer` must not repeat it.
+    let client = saladfingers_protocol::transfer::credentialed_client_builder()
         .timeout(Duration::from_secs(60))
         .build()?;
     let start = Instant::now();

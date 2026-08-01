@@ -111,7 +111,7 @@ async fn probe_and_fetch(cfg: &Config, client: &SaladClient, name: &str) -> Resu
 }
 
 async fn fetch_report(cfg: &Config, gateway: &str) -> Result<ProbeReport> {
-    let http = reqwest::Client::builder()
+    let http = saladfingers_protocol::transfer::credentialed_client_builder()
         .timeout(Duration::from_secs(30))
         .build()?;
     // The app may take a moment to bind after `running`; poll the gateway briefly.

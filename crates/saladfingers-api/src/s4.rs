@@ -56,7 +56,7 @@ impl S4Client {
         // Connect + read-stall timeouts, but no total-request deadline: S4 objects run
         // up to 100 MB and a total cap would bound throughput, while a client with no
         // timeouts at all hangs forever on a dead peer.
-        let http = reqwest::Client::builder()
+        let http = crate::http::credentialed_client_builder()
             .user_agent(concat!("saladfingers/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(30))
             .read_timeout(Duration::from_secs(120))
