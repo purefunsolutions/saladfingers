@@ -41,6 +41,13 @@ So that the assumptions below are read in context, these are already handled in 
   dashboard is never public, and `saladfingers tunnel` binds loopback only with no option
   to widen it — a wider bind would re-publish that deliberately private port to the local
   network, pre-authenticated with the operator's key.
+- `saladfingers tunnel` does not follow upstream redirects either, and for a sharper
+  reason than the in-container proxy: it attaches `Salad-Api-Key`, and a **custom** header
+  is one reqwest does not strip when a redirect crosses hosts (it drops only
+  `AUTHORIZATION`/`COOKIE`/…). Following one 3xx from an app behind the gateway — an
+  app-level open redirect is enough — would therefore hand the operator's account-wide
+  key to whatever host it named. The 3xx goes to the browser instead, with a `Location`
+  naming the gateway rewritten onto the tunnel so the browser is not walked off it.
 - The session API compares its bearer token in constant time and fails closed when the
   token is unset.
 - Local secrets are written owner-only at creation (0600 file, 0700 directory), and a

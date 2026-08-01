@@ -31,6 +31,18 @@
 //! construction — the same trade that put `session` and `serve` on long-poll.
 //! `connection` and `upgrade` are hop-by-hop and stripped here too, so an
 //! upgrade could not survive even if the edge allowed it.
+//!
+//! **Redirects are never followed, and the browser is kept on the tunnel.** Two
+//! halves of one rule. Following a 3xx here would carry `Salad-Api-Key` to
+//! whatever host it names — reqwest strips only the standard sensitive headers
+//! on a cross-host redirect, never a custom one — so the key this command exists
+//! to keep local would land on an arbitrary server. But simply handing the 3xx
+//! back is not enough either: the app sees the *gateway* as its `Host` and so
+//! builds absolute redirects naming it, and a browser sent there leaves the
+//! tunnel and meets the edge's 403, since a navigation cannot carry the key.
+//! So an upstream URL pointing at the gateway is rewritten back onto this
+//! process's own origin, and anything naming another host is passed through
+//! untouched — not ours to serve.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -77,8 +89,61 @@ const MAX_REQUEST_BODY: usize = 32 * 1024 * 1024;
 
 struct Tunnel {
     upstream: String,
+    /// This process's own origin (`http://127.0.0.1:<bound port>`), taken from the
+    /// listener rather than the flag so an ephemeral `:0` bind resolves to the real port.
+    /// An upstream URL naming the gateway is rewritten onto this — see
+    /// [`rewrite_upstream_url`].
+    local_base: String,
     api_key: String,
     http: reqwest::Client,
+}
+
+/// The tunnel's HTTP client.
+///
+/// One constructor, deliberately shared with the tests: a test that builds its own client
+/// pins the *test's* policy, so the redirect guard below could be deleted from the shipped
+/// path with the suite still green. Everything security-relevant about this client has to
+/// live where both callers get it.
+///
+/// No *total* timeout: SSE responses are long-lived by design, and the gateway's own 100 s
+/// cap already bounds them. A connect timeout is a different thing and is kept, matching
+/// every other client in this workspace.
+///
+/// **Never follow a redirect.** `Salad-Api-Key` is a custom header, and reqwest strips only
+/// the standard sensitive ones (`AUTHORIZATION`, `COOKIE`, `PROXY_AUTHORIZATION`, …) when a
+/// redirect crosses hosts — a custom header travels verbatim. With reqwest's default policy
+/// (follow up to 10), one 3xx from an app behind the gateway, or an app-level open redirect,
+/// would hand the operator's account-wide SaladCloud key to whatever host it named. Same
+/// rule, for the same reason, as `sf-agent`'s in-container proxy.
+///
+/// # Errors
+/// Returns an error if the client cannot be built.
+fn http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("building the tunnel's HTTP client")
+}
+
+/// Rewrite an absolute URL that names the gateway so it names this tunnel instead.
+///
+/// The browser's `host` is stripped on the way up, so reqwest sets the gateway's — which
+/// means the app behind it builds absolute URLs from the gateway's name. A `Location`
+/// carrying one, handed to a browser unchanged, sends that browser off the tunnel and
+/// straight at the edge, which answers **403** because a navigation cannot carry the key.
+/// That is precisely the failure this command exists to remove, so the redirect is aimed
+/// back here instead.
+///
+/// Returns `None` — meaning "pass through untouched" — for any URL that is not the
+/// gateway's. A URL on another host is not ours to serve, and pointing it at loopback
+/// would silently fetch some third party's path from the gateway.
+///
+/// The match is anchored at a component boundary: `https://gw.example.com` must not match
+/// `https://gw.example.com.attacker.test/`, which a bare `starts_with` would accept.
+fn rewrite_upstream_url(value: &str, upstream: &str, local_base: &str) -> Option<String> {
+    let rest = value.strip_prefix(upstream)?;
+    (rest.is_empty() || rest.starts_with(['/', '?', '#'])).then(|| format!("{local_base}{rest}"))
 }
 
 /// # Errors
@@ -113,25 +178,28 @@ pub async fn tunnel(cfg: Config, args: TunnelArgs) -> Result<()> {
         );
     };
 
+    // Bind before building the state: the tunnel has to know its own origin to rewrite
+    // the gateway out of upstream redirects, and only the listener knows the real port
+    // once an ephemeral bind is in play.
+    let listener = bind_loopback(args.local_port).await?;
+    let local_base = browser_url(
+        listener
+            .local_addr()
+            .context("reading the tunnel's own bound address")?
+            .port(),
+    );
+
     let state = Arc::new(Tunnel {
         upstream,
         api_key: cfg.api_key.expose().to_string(),
-        // No *total* timeout: SSE responses are long-lived by design, and the gateway's
-        // own 100 s cap already bounds them. A connect timeout is a different thing and
-        // is kept, matching every other client in this workspace.
-        http: reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .context("building the tunnel's HTTP client")?,
+        http: http_client()?,
+        local_base,
     });
-
-    let listener = bind_loopback(args.local_port).await?;
 
     eprintln!(
         "tunnel: {} -> {} (shard {want})\n  \
          the gateway is authenticated; this process holds the key. Ctrl-C to stop.",
-        browser_url(args.local_port),
-        state.upstream
+        state.local_base, state.upstream
     );
 
     let app = axum::Router::new()
@@ -207,9 +275,19 @@ async fn forward(State(st): State<Arc<Tunnel>>, req: Request) -> Response {
     let status = resp.status();
     let mut out = Response::builder().status(status);
     for (k, v) in resp.headers() {
-        if !HOP_BY_HOP.contains(&k.as_str().to_ascii_lowercase().as_str()) {
-            out = out.header(k, v);
+        if HOP_BY_HOP.contains(&k.as_str().to_ascii_lowercase().as_str()) {
+            continue;
         }
+        // The two headers a browser will *navigate* to. Any other value passes through
+        // byte-for-byte — this proxy rewrites destinations, not content.
+        if matches!(k.as_str(), "location" | "content-location")
+            && let Ok(text) = v.to_str()
+            && let Some(rewritten) = rewrite_upstream_url(text, &st.upstream, &st.local_base)
+        {
+            out = out.header(k, rewritten);
+            continue;
+        }
+        out = out.header(k, v);
     }
     // Stream, do not collect: an SSE body never ends on its own.
     let stream = resp
@@ -317,16 +395,19 @@ mod tests {
     }
 
     async fn serve_tunnel(upstream: String, api_key: &str) -> String {
+        // Bind first, exactly as production does: the tunnel needs its own origin before
+        // it can rewrite the gateway out of an upstream redirect.
+        let listener = bind_loopback(0).await.unwrap();
+        let base = browser_url(listener.local_addr().unwrap().port());
         let state = Arc::new(Tunnel {
             upstream,
             api_key: api_key.to_string(),
-            http: reqwest::Client::builder()
-                .connect_timeout(CONNECT_TIMEOUT)
-                .build()
-                .unwrap(),
+            // The production constructor, NOT a copy of its settings. A copy pins this
+            // helper's policy, which would let the redirect guard be deleted from
+            // `http_client` with every test here still green.
+            http: http_client().unwrap(),
+            local_base: base.clone(),
         });
-        let listener = bind_loopback(0).await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
         let app = axum::Router::new().fallback(forward).with_state(state);
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         base
@@ -378,5 +459,168 @@ mod tests {
             .await
             .expect("the tunnel answers rather than dying");
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// A server that counts what reaches it, so "the key never got there" is observable
+    /// rather than inferred. Returns `(base_url, hit_counter)`.
+    async fn counting_echo() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let route_hits = Arc::clone(&hits);
+        let app = axum::Router::new().fallback(move |req: Request| {
+            let hits = Arc::clone(&route_hits);
+            async move {
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                echo(req).await
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, hits)
+    }
+
+    /// A gateway that redirects `/go` to `location` and echoes everything else.
+    async fn redirecting_gateway(location: String) -> String {
+        let app = axum::Router::new().fallback(move |req: Request| {
+            // Per-call clone keeps the handler `Fn`: an `async move` would consume the
+            // captured `String` on the first request and make the closure `FnOnce`.
+            let location = location.clone();
+            async move {
+                if req.uri().path() == "/go" {
+                    // 302, not 307: the status a login flow actually emits, and the one
+                    // where a followed redirect would also rewrite the method to GET.
+                    return (
+                        StatusCode::FOUND,
+                        [(axum::http::header::LOCATION, location)],
+                    )
+                        .into_response();
+                }
+                echo(req).await
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        base
+    }
+
+    /// A browser that reports a 3xx instead of resolving it, so the tunnel's own answer
+    /// is what the assertions see.
+    fn non_following_browser() -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+    }
+
+    /// The security property: an upstream 3xx is never chased, so `Salad-Api-Key` — a
+    /// custom header reqwest does NOT strip across hosts — cannot reach the host the
+    /// redirect names. Proven by the redirect target recording zero requests, which also
+    /// catches the case where the tunnel forwards the key *and* returns the 3xx.
+    #[tokio::test]
+    async fn an_upstream_redirect_to_another_host_is_never_followed() {
+        let (elsewhere, elsewhere_hits) = counting_echo().await;
+        let gateway = redirecting_gateway(format!("{elsewhere}/landed")).await;
+        let local = serve_tunnel(gateway, "sk-secret").await;
+
+        let resp = non_following_browser()
+            .get(format!("{local}/go"))
+            .send()
+            .await
+            .expect("through the tunnel");
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::FOUND,
+            "the tunnel must hand the 3xx back, not resolve it to the target's 200"
+        );
+        assert_eq!(
+            elsewhere_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the tunnel followed the redirect — the operator's API key reached another host"
+        );
+        // A foreign host is not ours to serve: the Location is passed through as-is, so
+        // the browser decides, and nothing is silently fetched from the gateway instead.
+        assert_eq!(
+            resp.headers().get("location").and_then(|v| v.to_str().ok()),
+            Some(format!("{elsewhere}/landed").as_str()),
+            "a Location on another host must pass through unrewritten"
+        );
+    }
+
+    /// The usability half of the same rule. The app sees the gateway as its `Host`, so it
+    /// emits absolute redirects naming the gateway; handed to a browser unchanged, those
+    /// walk it off the tunnel and into the edge's 403 — the exact failure this command
+    /// exists to remove. They come back pointing at the tunnel instead.
+    #[tokio::test]
+    async fn a_redirect_naming_the_gateway_comes_back_pointing_at_the_tunnel() {
+        // One server that redirects to its OWN origin — what a framework does when it
+        // builds an absolute URL from the `Host` it was given.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}", listener.local_addr().unwrap());
+        let self_url = upstream.clone();
+        let app = axum::Router::new().fallback(move |req: Request| {
+            let self_url = self_url.clone();
+            async move {
+                if req.uri().path() == "/go" {
+                    return (
+                        StatusCode::FOUND,
+                        [(
+                            axum::http::header::LOCATION,
+                            format!("{self_url}/dashboard?tab=1"),
+                        )],
+                    )
+                        .into_response();
+                }
+                echo(req).await
+            }
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let local = serve_tunnel(upstream, "sk-secret").await;
+        let resp = non_following_browser()
+            .get(format!("{local}/go"))
+            .send()
+            .await
+            .expect("through the tunnel");
+
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        assert_eq!(
+            resp.headers().get("location").and_then(|v| v.to_str().ok()),
+            Some(format!("{local}/dashboard?tab=1").as_str()),
+            "a Location naming the gateway must come back on the tunnel's own origin, \
+             query intact — otherwise the browser leaves the tunnel and gets a 403"
+        );
+    }
+
+    /// The rewrite is anchored at a component boundary. A gateway DNS name is a prefix of
+    /// infinitely many other hostnames, and a bare `starts_with` would aim the browser at
+    /// the tunnel for a URL belonging to someone else entirely.
+    #[test]
+    fn only_the_gateways_own_origin_is_rewritten() {
+        let up = "https://gw.example.com";
+        let local = "http://127.0.0.1:7777";
+        assert_eq!(
+            rewrite_upstream_url("https://gw.example.com/a?b#c", up, local).as_deref(),
+            Some("http://127.0.0.1:7777/a?b#c")
+        );
+        assert_eq!(
+            rewrite_upstream_url("https://gw.example.com", up, local).as_deref(),
+            Some("http://127.0.0.1:7777")
+        );
+        // Not the gateway: a look-alike host, a different scheme, and a relative URL the
+        // browser already resolves against the tunnel on its own.
+        for foreign in [
+            "https://gw.example.com.attacker.test/steal",
+            "https://gw.example.comX/y",
+            "http://gw.example.com/a",
+            "/already-relative",
+        ] {
+            assert_eq!(
+                rewrite_upstream_url(foreign, up, local),
+                None,
+                "{foreign} must pass through untouched"
+            );
+        }
     }
 }
