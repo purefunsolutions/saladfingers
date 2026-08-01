@@ -194,6 +194,11 @@ saladfingers tunnel sf-x7k2mq --local-port 6006 --shard 2
   every response, which is exactly what the streaming guarantee above forbids; an app
   that hard-codes its own absolute origin in a page will send the browser off the
   tunnel, and relative URLs avoid that entirely.
+- **Cookies your app sets are re-scoped to the tunnel.** An app sees the gateway as its
+  `Host`, so a `Set-Cookie` naming that domain would be discarded outright by a browser
+  talking to `127.0.0.1` — a login that silently never sticks. The `Domain=` attribute is
+  dropped so the cookie becomes host-only for the tunnel; everything else about it is
+  passed through untouched.
 - **WebSockets do not work through it.** The gateway carries them only with `auth=false`
   ([salad-facts.md](salad-facts.md)), and `--expose-port` is `auth=true` by construction.
 
