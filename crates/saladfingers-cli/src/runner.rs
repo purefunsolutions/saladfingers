@@ -356,7 +356,8 @@ pub async fn reap(cfg: Config, args: RunIdArgs) -> Result<()> {
         .as_ref()
         .map(S3Backend::from_config)
         .transpose()?;
-    let http = reqwest::Client::builder()
+    // Reads result envelopes through presigned URLs, where the URL is the credential.
+    let http = transfer::credentialed_client_builder()
         .timeout(Duration::from_secs(60))
         .build()?;
     let shard_count = u32::try_from(run.groups.len().max(1)).unwrap_or(1);

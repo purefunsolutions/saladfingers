@@ -188,7 +188,9 @@ pub async fn status(cfg: Config, args: SessionNameArgs) -> Result<()> {
     println!("  state:   {st}");
     if let Some(url) = &gateway {
         println!("  gateway: {url}");
-        let http = reqwest::Client::new();
+        // The idle poll below presents the service's agent token, so the
+        // credential-safe builder applies (the ready probe sends nothing).
+        let http = saladfingers_protocol::transfer::credentialed_client_builder().build()?;
         let ready = matches!(
             http.get(format!("{url}/sf/v1/ready")).send().await,
             Ok(r) if r.status().is_success()
@@ -226,7 +228,8 @@ pub async fn autostop(cfg: Config, args: ServeAutostopArgs) -> Result<()> {
     // A bare `Client::new()` has no timeout, so one stalled poll — a half-open connection to
     // the gateway that never answers — would block the loop forever and the idle box would
     // bill on. 30 s is well under the gateway's own 100 s cap; a stalled poll just retries.
-    let http = reqwest::Client::builder()
+    // Credential-safe builder because every poll presents the agent token.
+    let http = saladfingers_protocol::transfer::credentialed_client_builder()
         .timeout(Duration::from_secs(30))
         .build()?;
 

@@ -184,6 +184,21 @@ saladfingers tunnel sf-x7k2mq --local-port 6006 --shard 2
 - SSE and token streams pass through (responses are streamed, not buffered), but the
   gateway still cuts any single request at **100 s** — a stream that must outlive that
   has to reconnect. Request bodies are buffered and capped at 32 MiB.
+- **Redirects are not followed, and a redirect back to the gateway is rewritten onto
+  the tunnel.** Following one would carry the API key to whatever host it named, so the
+  3xx goes to the browser instead — and because your app sees the *gateway* as its
+  `Host`, the absolute URLs it builds are pointed back at `127.0.0.1` so the browser
+  stays on the tunnel rather than meeting the edge's 403. A redirect naming any other
+  host is passed through untouched, for the browser to decide about. URLs inside an
+  HTML or JavaScript body are **not** rewritten — rewriting them would mean buffering
+  every response, which is exactly what the streaming guarantee above forbids; an app
+  that hard-codes its own absolute origin in a page will send the browser off the
+  tunnel, and relative URLs avoid that entirely.
+- **Cookies your app sets are re-scoped to the tunnel.** An app sees the gateway as its
+  `Host`, so a `Set-Cookie` naming that domain would be discarded outright by a browser
+  talking to `127.0.0.1` — a login that silently never sticks. The `Domain=` attribute is
+  dropped so the cookie becomes host-only for the tunnel; everything else about it is
+  passed through untouched.
 - **WebSockets do not work through it.** The gateway carries them only with `auth=false`
   ([salad-facts.md](salad-facts.md)), and `--expose-port` is `auth=true` by construction.
 

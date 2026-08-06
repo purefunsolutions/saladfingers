@@ -359,20 +359,29 @@ pub async fn gc(cfg: Config, args: GcArgs) -> Result<()> {
         reaped_run_ids.sort();
         reaped_run_ids.dedup();
         match crate::presign::S3Backend::from_config(storage) {
+            // Signs list and delete URLs: the URL is the credential — which is why a
+            // client that fails to build is not papered over with `Client::default()`,
+            // whose stock policy follows redirects off-host and sends `Referer`. Skip
+            // the cleanup loudly instead, like a missing backend; the state release
+            // below still runs either way.
             Ok(backend) => {
-                let http = reqwest::Client::new();
-                for rid in &reaped_run_ids {
-                    let prefix = crate::spec::run_prefix(rid);
-                    match backend.delete_prefix(&http, &prefix).await {
-                        Ok((0, 0)) => {}
-                        Ok((n, 0)) => eprintln!("removed {n} object(s) under {prefix}"),
-                        // Best-effort here, but not silent: what survives is storage
-                        // waste the operator would otherwise never learn about.
-                        Ok((n, failed)) => eprintln!(
-                            "removed {n} object(s) under {prefix}; {failed} could not be deleted"
-                        ),
-                        Err(e) => eprintln!("prefix cleanup for {prefix} failed: {e}"),
+                match saladfingers_protocol::transfer::credentialed_client_builder().build() {
+                    Ok(http) => {
+                        for rid in &reaped_run_ids {
+                            let prefix = crate::spec::run_prefix(rid);
+                            match backend.delete_prefix(&http, &prefix).await {
+                                Ok((0, 0)) => {}
+                                Ok((n, 0)) => eprintln!("removed {n} object(s) under {prefix}"),
+                                // Best-effort here, but not silent: what survives is storage
+                                // waste the operator would otherwise never learn about.
+                                Ok((n, failed)) => eprintln!(
+                                    "removed {n} object(s) under {prefix}; {failed} could not be deleted"
+                                ),
+                                Err(e) => eprintln!("prefix cleanup for {prefix} failed: {e}"),
+                            }
+                        }
                     }
+                    Err(e) => eprintln!("skipping remote cleanup (building its HTTP client): {e}"),
                 }
             }
             Err(e) => eprintln!("skipping remote cleanup (storage unavailable): {e}"),

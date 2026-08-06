@@ -32,17 +32,46 @@ So that the assumptions below are read in context, these are already handled in 
   must be plain relative paths and must match an output the run actually declared; the
   reported part count is capped at the run's `max_artifact_parts`; a zero-part artifact is
   refused rather than silently satisfying the SHA-256 gate.
+
 - Archive extraction is confined by `unpack_in` (no path traversal, no absolute or
   symlinked entries) and capped at 100× the compressed size, so a hostile `tar | zstd`
   cannot fill the collector's disk.
+
 - The `serve --proxy` reverse proxy targets a fixed loopback address, strips hop-by-hop
   headers, and does not follow upstream redirects.
+
 - `run --expose-port` creates the gateway with `auth=true`, so an exposed training
   dashboard is never public, and `saladfingers tunnel` binds loopback only with no option
   to widen it — a wider bind would re-publish that deliberately private port to the local
   network, pre-authenticated with the operator's key.
+
+- **No credential follows a redirect to another host.** Two channels carry one, and both
+  are closed for every client in the workspace that holds a credential:
+
+  - a **custom header** — `Salad-Api-Key`, the session bearer, the IMDS workload JWT — is
+    *not* stripped by reqwest when a redirect crosses hosts (it drops only
+    `AUTHORIZATION`/`COOKIE`/`PROXY-AUTHORIZATION`/…), so with the default policy one 3xx
+    hands the operator's account-wide key to whatever host it names;
+  - **`Referer`**, which reqwest sends by default and which repeats the previous URL
+    *including its query* — and for a presigned URL the query **is** the credential
+    (`X-Amz-Signature=…`), so a redirect publishes a live storage capability.
+
+  Every such client is therefore built from a shared constructor that refuses a
+  cross-origin redirect by name, sends no `Referer`, and cuts a same-origin redirect
+  loop at five hops, while still following an ordinary same-origin move. This includes
+  `serve`'s idle pollers, which present the service's agent token; only its readiness
+  probe is excluded — that endpoint is `auth=false` and the probe sends no credential
+  at all.
+
+- `saladfingers tunnel` goes further and follows *no* redirect, because a reverse proxy
+  must hand the 3xx back to the browser rather than resolve it. A `Location` naming the
+  gateway is rewritten onto the tunnel's own loopback origin, so the browser is not walked
+  off the tunnel into the edge's 403; a `Location` naming any other host is passed through
+  untouched. `sf-agent`'s in-container proxy has the same no-redirect rule.
+
 - The session API compares its bearer token in constant time and fails closed when the
   token is unset.
+
 - Local secrets are written owner-only at creation (0600 file, 0700 directory), and a
   hand-written, world-readable API key file is flagged on use.
 
