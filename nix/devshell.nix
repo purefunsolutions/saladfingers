@@ -22,7 +22,7 @@
         # Ephemeral-local-Garage backing for the `presign_round_trip` test, so a
         # developer's `cargo nextest run` exercises the same path as CI. Linux-only:
         # garage isn't guaranteed to build on the flake's darwin systems.
-        ++ (pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.garage]);
+        ++ (pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.garage_2]);
     };
   };
 }

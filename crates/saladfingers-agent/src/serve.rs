@@ -15,6 +15,13 @@
 //! gateway's 100 s / 1 GB limits: output is long-polled (≤30 s waits) and files move
 //! in bounded chunks.
 
+// Handlers return `Result<T, Response>` — axum's own idiom: the `Err` arm is a finished
+// HTTP response, built where the failure is understood. `Response` is 128 bytes, which
+// clippy 1.99's `result_large_err` counts as large, but boxing it is no fix: axum has no
+// `IntoResponse` for `Box<Response>`, and an error leaves the handler once per request,
+// never on a hot path.
+#![allow(clippy::result_large_err)]
+
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::os::unix::process::ExitStatusExt;

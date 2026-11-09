@@ -561,12 +561,12 @@ admin_token = "{ADMIN_TOKEN}"
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
 
-        // Provision the cluster layout, then the bucket + key. `garage server` (the
-        // nixpkgs 1.x version has no `--single-node` flag) starts unconfigured; without an
-        // applied layout every admin RPC fails with "could not reach quorum", so assign
-        // this node a role and apply it before creating anything. Newer garage versions
-        // that accept `--single-node` would fold these steps in; this path is a superset
-        // that works across both.
+        // Provision the cluster layout, then the bucket + key. A plain `garage server`
+        // starts unconfigured; without an applied layout every admin RPC fails with
+        // "could not reach quorum", so assign this node a role and apply it before
+        // creating anything. Nix pins Garage 2.x, whose `--single-node` would fold these
+        // steps in, but 1.x has no such flag — doing it by hand keeps the harness working
+        // with whichever `garage` a developer has on PATH.
         let node_id = garage_cmd(&config_path, &["node", "id"])
             .await
             .lines()

@@ -42,11 +42,11 @@
           # systems and darwin CI is disabled; the test self-skips elsewhere.
           nativeBuildInputs =
             (commonArgs.nativeBuildInputs or [])
-            ++ (pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.garage]);
+            ++ (pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.garage_2]);
           SALADFINGERS_GARAGE_BIN =
             pkgs.lib.optionalString
             pkgs.stdenv.hostPlatform.isLinux
-            "${pkgs.garage}/bin/garage";
+            "${pkgs.garage_2}/bin/garage";
         });
 
       saladfingers-doc = craneLib.cargoDoc (commonArgs
