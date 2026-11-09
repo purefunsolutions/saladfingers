@@ -11,9 +11,9 @@
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
+use saladfingers::logs::{fetch_entries, fetch_uploaded};
+use saladfingers::presign::S3Backend;
 use saladfingers_api::{RetryPolicy, SaladClient, SaladClientConfig, Secret};
-use saladfingers_cli::logs::{fetch_entries, fetch_uploaded};
-use saladfingers_cli::presign::S3Backend;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -259,15 +259,14 @@ async fn a_burst_sharing_one_timestamp_keeps_its_order() {
 fn follow_refuses_the_window_flags_without_tripping_on_their_defaults() {
     use clap::Parser as _;
 
-    let ok =
-        saladfingers_cli::cli::Cli::try_parse_from(["saladfingers", "logs", "sf-x", "--follow"]);
+    let ok = saladfingers::cli::Cli::try_parse_from(["saladfingers", "logs", "sf-x", "--follow"]);
     assert!(ok.is_ok(), "plain --follow must still parse");
 
     for extra in [vec!["--all"], vec!["--limit", "10"], vec!["--since", "2h"]] {
         let mut argv = vec!["saladfingers", "logs", "sf-x", "--follow"];
         argv.extend_from_slice(&extra);
         assert!(
-            saladfingers_cli::cli::Cli::try_parse_from(&argv).is_err(),
+            saladfingers::cli::Cli::try_parse_from(&argv).is_err(),
             "{extra:?} with --follow must be refused, not silently ignored"
         );
     }
@@ -280,17 +279,11 @@ fn shard_only_means_something_with_uploaded() {
     use clap::Parser as _;
 
     assert!(
-        saladfingers_cli::cli::Cli::try_parse_from([
-            "saladfingers",
-            "logs",
-            "sf-x",
-            "--shard",
-            "1"
-        ])
-        .is_err()
+        saladfingers::cli::Cli::try_parse_from(["saladfingers", "logs", "sf-x", "--shard", "1"])
+            .is_err()
     );
     assert!(
-        saladfingers_cli::cli::Cli::try_parse_from([
+        saladfingers::cli::Cli::try_parse_from([
             "saladfingers",
             "logs",
             "sf-x",
@@ -302,7 +295,7 @@ fn shard_only_means_something_with_uploaded() {
     );
     // The default must not trip `requires`, or `--uploaded` alone would stop working.
     assert!(
-        saladfingers_cli::cli::Cli::try_parse_from(["saladfingers", "logs", "sf-x", "--uploaded"])
+        saladfingers::cli::Cli::try_parse_from(["saladfingers", "logs", "sf-x", "--uploaded"])
             .is_ok()
     );
 }

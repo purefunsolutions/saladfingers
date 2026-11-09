@@ -8,7 +8,7 @@ members = [
   "crates/saladfingers-api",
   "crates/saladfingers-protocol",
   "crates/saladfingers-agent",
-  "crates/saladfingers-cli",
+  "crates/saladfingers",
 ]
 
 [workspace.package]

@@ -6,11 +6,11 @@
 
 use anyhow::Result;
 use clap::Parser;
-use saladfingers_cli::cli::Cli;
+use saladfingers::cli::Cli;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    saladfingers_cli::init_tracing();
+    saladfingers::init_tracing();
     let cli = Cli::parse();
-    saladfingers_cli::dispatch(cli).await
+    saladfingers::dispatch(cli).await
 }

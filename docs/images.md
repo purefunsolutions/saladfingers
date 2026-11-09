@@ -115,7 +115,7 @@ What the module guarantees:
 - **`saladfingers.images.<name>` → `packages.<name>-image`.** That suffix is a
   contract, not a convention: `saladfingers image push <name>` runs
   `nix run <root>#packages.<system>.<name>-image.copyTo` (see
-  `crates/saladfingers-cli/src/image.rs`). Deriving it from the attribute name is the
+  `crates/saladfingers/src/image.rs`). Deriving it from the attribute name is the
   point — a misspelled package attribute is no longer possible, and `push` works for
   any declared image without further wiring.
 - **`pkgs` and `name` are injected** — `pkgs` is the consumer's `perSystem` pkgs,

@@ -89,7 +89,7 @@ Four Rust crates:
   and S4 storage.
 - **`saladfingers-agent`** — `sf-agent`, a small binary baked into every image
   (`run` / `serve` / `probe` modes).
-- **`saladfingers-cli`** — the `saladfingers` binary.
+- **`saladfingers`** — the `saladfingers` binary.
 
 Plus a Nix image library (`nix/image-lib.nix`) exporting `mkSaladImage`, which a
 project imports to define its own CUDA/ROCm images and get a pushable,
