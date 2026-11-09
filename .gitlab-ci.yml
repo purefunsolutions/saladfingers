@@ -20,6 +20,21 @@ ci-image:
     # runner catches a broken darwin path without a macOS runner; only the build itself
     # would need one.
     - nix eval --raw .#packages.aarch64-darwin.gpu-probe-image.drvPath
+# aarch64-linux, built on the aarch64-linux builder attached to the runner. The runner is
+# x86_64-linux, so the `nix flake check` above omits this system entirely. This builds
+# every aarch64-linux check (clippy, nextest, doc, …), the default package, and the
+# gpu-probe image as an aarch64-linux host assembles it — the path `saladfingers image
+# push` takes there. The check list is read from the flake, so a new check is covered
+# without editing this file; it is assigned on its own line so that a failed eval fails
+# the job rather than leaving `nix build` with no checks to build.
+ci-aarch64-linux:
+  stage: ci
+  interruptible: true
+  script:
+    - |
+      checks=$(nix eval --raw .#checks.aarch64-linux \
+        --apply 'cs: toString (map (n: ".#checks.aarch64-linux." + n) (builtins.attrNames cs))')
+      nix build -L $checks .#packages.aarch64-linux.default .#packages.aarch64-linux.gpu-probe-image
 # macOS build disabled for now (no macOS runner). Re-enable when one is available:
 # ci-macos:
 #   stage: ci
