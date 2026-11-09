@@ -15,10 +15,12 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0 OR BSD-3-Clause"
-# The smaller of the flake's two Rust toolchains — nixpkgs-native rustc (nixos-unstable,
-# 1.96.1) vs the rust-overlay stable used by CI (1.97.1) — so an upstream nixpkgs build
-# with its own compiler satisfies the MSRV.
-rust-version = "1.96"
+# NixOS 26.11's rustc, so a build with that release's own compiler satisfies the MSRV.
+# 26.11 branches off nixos-unstable, which already ships 1.99.1, so the release has at
+# least 1.99; recheck once it is out, since it may ship 1.100. CI's rust-overlay stable
+# and the flake's nixpkgs rustc are both 1.99.1. Raising this lets cargo's MSRV-aware
+# resolver (resolver 3) pick dependency releases that need up to this version.
+rust-version = "1.99"
 
 [workspace.dependencies]
 saladfingers-api = { path = "crates/saladfingers-api" }
