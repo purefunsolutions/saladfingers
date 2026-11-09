@@ -7,8 +7,13 @@ name = "saladfingers-protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
 rust-version.workspace = true
 description = "Shared wire contract between the saladfingers CLI and the in-container sf-agent."
+readme = "README.md"
+keywords = ["saladcloud", "gpu", "cloud", "protocol"]
+categories = ["network-programming"]
 
 [features]
 default = ["transfer"]
