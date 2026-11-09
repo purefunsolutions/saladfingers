@@ -132,6 +132,7 @@ in {
   in {
     _module.args.pkgs = pkgs;
     _module.args.craneLib = craneLib;
+    _module.args.rustToolchain = rustToolchain;
     _module.args.commonArgs = commonArgs;
     _module.args.cargoArtifacts = cargoArtifacts;
 

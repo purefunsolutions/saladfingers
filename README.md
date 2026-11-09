@@ -132,6 +132,7 @@ Docs live under [`docs/`](docs/): SaladCloud facts, [one-shot runs](docs/run.md)
 [macOS](docs/macos.md) and [platform](docs/platforms.md) support, the empirical node
 findings, and the [security model](docs/security.md) — trust boundaries plus the two
 assumptions that follow from never putting a credential inside a container.
+[Releasing](docs/releasing.md) covers how the crates get to crates.io.
 
 ## License
 
