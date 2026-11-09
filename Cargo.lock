@@ -1797,7 +1797,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "saladfingers"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1828,7 +1828,7 @@ dependencies = [
 
 [[package]]
 name = "saladfingers-agent"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1855,7 +1855,7 @@ dependencies = [
 
 [[package]]
 name = "saladfingers-api"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "bytes",
  "chrono",
@@ -1871,7 +1871,7 @@ dependencies = [
 
 [[package]]
 name = "saladfingers-protocol"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "axum",
