@@ -1796,6 +1796,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "saladfingers"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "clap",
+ "comfy-table",
+ "futures-util",
+ "getrandom 0.4.3",
+ "humantime",
+ "reqwest",
+ "rust_decimal",
+ "rusty-s3",
+ "saladfingers-api",
+ "saladfingers-protocol",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "wiremock",
+]
+
+[[package]]
 name = "saladfingers-agent"
 version = "0.1.0"
 dependencies = [
@@ -1835,37 +1866,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "wiremock",
-]
-
-[[package]]
-name = "saladfingers-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64 0.22.1",
- "bytes",
- "chrono",
- "clap",
- "comfy-table",
- "futures-util",
- "getrandom 0.4.3",
- "humantime",
- "reqwest",
- "rust_decimal",
- "rusty-s3",
- "saladfingers-api",
- "saladfingers-protocol",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "url",
  "wiremock",
 ]
 

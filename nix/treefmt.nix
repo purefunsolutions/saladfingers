@@ -31,6 +31,16 @@
         yamlfmt.enable = true;
         mdformat.enable = true;
       };
+
+      # The release scripts are writeShellApplication bodies: no shebang, and written
+      # for the `set -o errexit` it prepends. writeShellApplication shellchecks them in
+      # that context on every build (nix/release.nix), and they pass. Bare, without
+      # it, shellcheck asks for a shell (SC2148) and for `cd … || exit` (SC2164); the
+      # files are furymodel's and stay identical to it, so they skip this pass instead.
+      settings.formatter.shellcheck.excludes = [
+        "nix/release.sh"
+        "nix/publish-releases.sh"
+      ];
     };
   };
 }

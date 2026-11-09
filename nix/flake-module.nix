@@ -17,7 +17,7 @@
 #
 # The `-image` suffix is a HARD CONTRACT: `saladfingers image push <name>` runs
 # `nix run <root>#packages.<system>.<name>-image.copyTo` (see
-# crates/saladfingers-cli/src/image.rs). Deriving that package name from the attribute
+# crates/saladfingers/src/image.rs). Deriving that package name from the attribute
 # key — instead of leaving it to the consumer to spell correctly — is the point of this
 # module; `pkgs`, `nativePkgs` and `name` are injected, so none can be got wrong.
 #

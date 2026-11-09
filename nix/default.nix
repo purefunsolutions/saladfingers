@@ -8,5 +8,6 @@
     ./devshell.nix
     ./treefmt.nix
     ./images.nix
+    ./release.nix
   ];
 }

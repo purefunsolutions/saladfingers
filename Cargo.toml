@@ -8,13 +8,15 @@ members = [
   "crates/saladfingers-api",
   "crates/saladfingers-protocol",
   "crates/saladfingers-agent",
-  "crates/saladfingers-cli",
+  "crates/saladfingers",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0 OR BSD-3-Clause"
+repository = "https://github.com/purefunsolutions/saladfingers"
+authors = ["Mika Tammi <mikatammi@gmail.com>"]
 # NixOS 26.11's rustc, so a build with that release's own compiler satisfies the MSRV.
 # 26.11 branches off nixos-unstable, which already ships 1.99.1, so the release has at
 # least 1.99; recheck once it is out, since it may ship 1.100. CI's rust-overlay stable
@@ -23,8 +25,8 @@ license = "MIT OR Apache-2.0 OR BSD-3-Clause"
 rust-version = "1.99"
 
 [workspace.dependencies]
-saladfingers-api = { path = "crates/saladfingers-api" }
-saladfingers-protocol = { path = "crates/saladfingers-protocol" }
+saladfingers-api = { path = "crates/saladfingers-api", version = "0.1.0" }
+saladfingers-protocol = { path = "crates/saladfingers-protocol", version = "0.1.0" }
 
 # CLI / config
 clap = { version = "4", features = ["derive", "env"] }

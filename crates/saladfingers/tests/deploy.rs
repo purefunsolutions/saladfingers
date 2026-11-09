@@ -6,8 +6,8 @@
 
 use std::time::Duration;
 
+use saladfingers::deploy::{PollOptions, poll_until_running, resolve_gpu_uuids};
 use saladfingers_api::{GroupStatus, RetryPolicy, SaladClient, SaladClientConfig, Secret};
-use saladfingers_cli::deploy::{PollOptions, poll_until_running, resolve_gpu_uuids};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 

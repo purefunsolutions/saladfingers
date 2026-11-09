@@ -24,9 +24,9 @@ use axum::extract::{Path as AxPath, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::any;
-use saladfingers_cli::checkpoint::{Target, fetch_into, resolve};
-use saladfingers_cli::presign::S3Backend;
-use saladfingers_cli::spec;
+use saladfingers::checkpoint::{Target, fetch_into, resolve};
+use saladfingers::presign::S3Backend;
+use saladfingers::spec;
 use saladfingers_protocol::job::CheckpointMeta;
 use saladfingers_protocol::{PROTOCOL_VERSION, transfer};
 

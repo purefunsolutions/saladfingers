@@ -24,7 +24,8 @@ in {
     commonArgs = {
       inherit src;
       pname = "saladfingers";
-      version = "0.1.0";
+      # The version, shared by the crates, which a release commit sets.
+      inherit ((builtins.fromTOML (builtins.readFile ../Cargo.toml)).workspace.package) version;
       strictDeps = true;
       # reqwest 0.13's rustls uses the aws-lc-rs crypto provider. aws-lc-sys
       # ships pregenerated bindings for every system in this flake and builds
@@ -131,6 +132,7 @@ in {
   in {
     _module.args.pkgs = pkgs;
     _module.args.craneLib = craneLib;
+    _module.args.rustToolchain = rustToolchain;
     _module.args.commonArgs = commonArgs;
     _module.args.cargoArtifacts = cargoArtifacts;
 

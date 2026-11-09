@@ -7,8 +7,13 @@ name = "saladfingers-agent"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
 rust-version.workspace = true
 description = "sf-agent: the in-container agent baked into every saladfingers image."
+readme = "README.md"
+keywords = ["saladcloud", "gpu", "cloud", "agent", "container"]
+categories = ["command-line-utilities", "virtualization"]
 
 [[bin]]
 name = "sf-agent"

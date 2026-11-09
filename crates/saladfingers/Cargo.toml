@@ -3,12 +3,17 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0 OR BSD-3-Clause
 
 [package]
-name = "saladfingers-cli"
+name = "saladfingers"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
 rust-version.workspace = true
 description = "saladfingers: rent SaladCloud GPUs for minimum billed seconds."
+readme = "README.md"
+keywords = ["saladcloud", "gpu", "cloud", "cli", "nix"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "saladfingers"

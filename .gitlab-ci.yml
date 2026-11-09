@@ -1,9 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Mika Tammi / Pure Fun Solutions
 #
 # SPDX-License-Identifier: MIT OR Apache-2.0 OR BSD-3-Clause
+#
+# GitLab CI on an x86_64-linux runner with an aarch64-linux builder attached: the
+# flake's checks and packages on both systems, a check that the crates would publish,
+# and on master a push to the public GitHub repository and the release of the release
+# tags merged into it (docs/releasing.md).
 stages:
   - ci
   - publish
+  - release
+# Branch pipelines only. A release tag reaches GitLab with its merge request
+# (nix/release.sh), and master's pipeline releases it once that is merged, so tags get
+# no pipeline of their own.
+workflow:
+  rules:
+    - if: '$CI_COMMIT_TAG'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - when: always
 ci:
   stage: ci
   interruptible: true
@@ -35,39 +51,75 @@ ci-aarch64-linux:
       checks=$(nix eval --raw .#checks.aarch64-linux \
         --apply 'cs: toString (map (n: ".#checks.aarch64-linux." + n) (builtins.attrNames cs))')
       nix build -L $checks .#packages.aarch64-linux.default .#packages.aarch64-linux.gpu-probe-image
+# The crates as a release would publish them, short of the upload: the release job's
+# own script packages them and builds them from their packages
+# (nix run .#publish-releases -- --check), so that a merge request whose crates couldn't
+# be published doesn't merge.
+publish-check:
+  stage: ci
+  interruptible: true
+  script:
+    - nix run .#publish-releases -- --check
 # macOS build disabled for now (no macOS runner). Re-enable when one is available:
 # ci-macos:
 #   stage: ci
 #   interruptible: true
 #   script:
 #     - nix build -L .#packages.aarch64-darwin.default
-# Mirror master to the public GitHub repository. Lives in the publish stage, so it
-# only runs once the ci stage is green — a broken master never reaches GitHub.
+# The public GitHub repository over ssh, for the jobs that push to it.
 #
-# GITHUB_DEPLOY_KEY_B64 is a masked+protected CI variable holding `base64 -w0` of an
-# ed25519 private key whose public half is a write-enabled deploy key on the GitHub
-# repo. The remote URL and GitHub's host key are public, so they belong in this file
-# (which itself gets mirrored); only the private key is a secret.
-publish-github:
-  stage: publish
-  interruptible: false
-  resource_group: github-mirror
+# GITHUB_DEPLOY_KEY_B64 is a masked, protected CI variable holding the base64 of an
+# ed25519 private key whose public half is a deploy key with write access on the GitHub
+# repository. The remote and GitHub's host key are public, so they belong in this file,
+# which is mirrored too. The key's directory is the job's own, in case a home is ever
+# shared: resource_group orders only this project's jobs.
+.github:
   variables:
     GIT_DEPTH: "0"
     GITHUB_REMOTE: "git@github.com:purefunsolutions/saladfingers.git"
+  before_script:
+    - key_dir="$HOME/.github-mirror-$CI_PROJECT_ID-$CI_JOB_ID"
+    - install -d -m700 "$key_dir"
+    - printf '%s' "$GITHUB_DEPLOY_KEY_B64" | base64 -d > "$key_dir/key"
+    - chmod 600 "$key_dir/key"
+    # GitHub's published ed25519 host key; refresh it from
+    # https://api.github.com/meta.
+    - echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > "$key_dir/known_hosts"
+    - export GITHUB_SSH_COMMAND="ssh -i $key_dir/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$key_dir/known_hosts -o StrictHostKeyChecking=yes"
+  after_script:
+    - rm -rf "$HOME/.github-mirror-$CI_PROJECT_ID-$CI_JOB_ID"
+# Pushes master to the public GitHub repository, in the publish stage, so only after the
+# ci stage passed: a broken master never reaches GitHub. Tags go only through the
+# release job, once checked.
+publish-github:
+  extends: .github
+  stage: publish
+  interruptible: false
+  resource_group: github-mirror
   rules:
     - if: '$CI_COMMIT_BRANCH == "master"'
   script:
-    - install -d -m700 "$HOME/.sf-mirror"
-    - printf '%s' "$GITHUB_DEPLOY_KEY_B64" | base64 -d > "$HOME/.sf-mirror/key"
-    - chmod 600 "$HOME/.sf-mirror/key"
-    # GitHub's published ed25519 host key; refresh from https://api.github.com/meta.
-    - echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > "$HOME/.sf-mirror/known_hosts"
-    # The runner only fetches the pipeline ref and the branch, so no tags are present
-    # locally — without this, --tags below is a silent no-op.
-    - git fetch --no-recurse-submodules origin '+refs/tags/*:refs/tags/*'
-    # refs/heads/ spelled out: the runner pushes a detached HEAD into a repo that
-    # starts out empty, so git cannot infer the ref type on either side.
-    - git -c core.sshCommand="ssh -i $HOME/.sf-mirror/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.sf-mirror/known_hosts -o StrictHostKeyChecking=yes" push "$GITHUB_REMOTE" HEAD:refs/heads/master --tags
-  after_script:
-    - rm -rf "$HOME/.sf-mirror"
+    # refs/heads/ spelled out: the runner pushes a detached HEAD, at first into an
+    # empty repository, so git can infer neither side's ref type.
+    - git -c core.sshCommand="$GITHUB_SSH_COMMAND" push "$GITHUB_REMOTE" HEAD:refs/heads/master
+# Releases the release tags merged into master, after master reached GitHub: each is
+# checked against the release signing key and its commit's version, pushed to GitHub,
+# and its commit's crates are published to crates.io (nix/publish-releases.sh). A run
+# after a failure carries on where the last one stopped, and one with nothing to
+# release does nothing.
+#
+# CARGO_REGISTRY_TOKEN is a masked, protected and hidden CI variable holding a crates.io
+# API token that may publish this repository's crates. RELEASE_SIGNING_KEY is a
+# protected file variable holding the public key whose fingerprint is RELEASE_SIGNER,
+# the key release tags are signed with.
+release:
+  extends: .github
+  stage: release
+  interruptible: false
+  resource_group: release
+  variables:
+    RELEASE_SIGNER: "3606AD2B342F70B3B306E724BF5BDF55A9735223"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+  script:
+    - nix run .#publish-releases

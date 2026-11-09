@@ -89,7 +89,7 @@ Four Rust crates:
   and S4 storage.
 - **`saladfingers-agent`** — `sf-agent`, a small binary baked into every image
   (`run` / `serve` / `probe` modes).
-- **`saladfingers-cli`** — the `saladfingers` binary.
+- **`saladfingers`** — the `saladfingers` binary.
 
 Plus a Nix image library (`nix/image-lib.nix`) exporting `mkSaladImage`, which a
 project imports to define its own CUDA/ROCm images and get a pushable,
@@ -132,6 +132,7 @@ Docs live under [`docs/`](docs/): SaladCloud facts, [one-shot runs](docs/run.md)
 [macOS](docs/macos.md) and [platform](docs/platforms.md) support, the empirical node
 findings, and the [security model](docs/security.md) — trust boundaries plus the two
 assumptions that follow from never putting a credential inside a container.
+[Releasing](docs/releasing.md) covers how the crates get to crates.io.
 
 ## License
 
