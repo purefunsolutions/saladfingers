@@ -163,7 +163,7 @@ async fn handle(
             if path.ends_with("meta.json")
                 && store
                     .ack_lost_meta
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                     .is_ok()
             {
                 // The write lands; the response is lost. From the writer's side this is
@@ -209,7 +209,7 @@ async fn handle(
             if path.ends_with("meta.json")
                 && store
                     .throttle_meta_gets
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                     .is_ok()
             {
                 return StatusCode::TOO_MANY_REQUESTS.into_response();
